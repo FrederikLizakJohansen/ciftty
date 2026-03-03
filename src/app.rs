@@ -28,7 +28,9 @@ const MAX_SCREEN_SCALE: f32 = 1_000.0;
 const ISO_PITCH: f32 = 0.615_479_7; // atan(1/sqrt(2))
 const ISO_YAW: f32 = std::f32::consts::FRAC_PI_4;
 const BOUNDARY_EPSILON: f32 = 0.02;
-const CELL_LINE_DEPTH_BIAS: f32 = 1_000.0;
+// Keep cell edges slightly behind equal-depth atom surfaces without forcing
+// the entire cell wireframe behind all atoms.
+const CELL_LINE_DEPTH_BIAS: f32 = 1e-3;
 const BOND_LINE_DEPTH_BIAS: f32 = 900.0;
 const MOUSE_SENSITIVITY: f32 = 0.01; // radians per terminal column/row dragged
 // Terminal character cells are roughly twice as tall as wide in pixels.
@@ -41,23 +43,37 @@ const BOND_MAX_DISTANCE_STEP: f32 = 0.10;
 const SHADE_RAMP_CLASSIC: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 // Dense shading ramp from dark to bright; this fills terminal rows better.
 const SHADE_RAMP_DENSE: &[char] = &[' ', '░', '▒', '▓', '█'];
+// Orbital theme: circular shades for a softer, stylized look.
+const SHADE_RAMP_ORBITAL: &[char] = &[' ', '·', '∘', '○', '◍', '●'];
+// Neon theme: high-contrast punctuated ramp.
+const SHADE_RAMP_NEON: &[char] = &[' ', '.', ':', '*', 'o', 'O', '@'];
 // Lambert light direction (normalized below in sphere_glyph).
 const LIGHT: [f32; 3] = [0.268, 0.358, 0.894]; // normalize([0.3, 0.4, 1.0])
 const CELL_LINE_COLOR: Color = Color::White;
 const BOND_LINE_COLOR: Color = Color::Gray;
 const LABEL_COLOR: Color = Color::White;
+const AXIS_X_COLOR: Color = Color::Red;
+const AXIS_Y_COLOR: Color = Color::Green;
+const AXIS_Z_COLOR: Color = Color::Blue;
+const ORIENTATION_GIZMO_RADIUS_COLS: f32 = 5.0;
+const ORIENTATION_GIZMO_MARGIN_COLS: f32 = 2.0;
+const ORIENTATION_GIZMO_MARGIN_ROWS: f32 = 2.0;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenderTheme {
     Dense,
     Classic,
+    Orbital,
+    Neon,
 }
 
 impl RenderTheme {
-    fn toggled(self) -> Self {
+    fn next(self) -> Self {
         match self {
             Self::Dense => Self::Classic,
-            Self::Classic => Self::Dense,
+            Self::Classic => Self::Orbital,
+            Self::Orbital => Self::Neon,
+            Self::Neon => Self::Dense,
         }
     }
 
@@ -65,6 +81,8 @@ impl RenderTheme {
         match self {
             Self::Dense => "dense",
             Self::Classic => "classic",
+            Self::Orbital => "orbital",
+            Self::Neon => "neon",
         }
     }
 
@@ -72,6 +90,8 @@ impl RenderTheme {
         match self {
             Self::Dense => SHADE_RAMP_DENSE,
             Self::Classic => SHADE_RAMP_CLASSIC,
+            Self::Orbital => SHADE_RAMP_ORBITAL,
+            Self::Neon => SHADE_RAMP_NEON,
         }
     }
 
@@ -79,6 +99,8 @@ impl RenderTheme {
         match self {
             Self::Dense => '▒',
             Self::Classic => ':',
+            Self::Orbital => '·',
+            Self::Neon => '=',
         }
     }
 
@@ -86,6 +108,24 @@ impl RenderTheme {
         match self {
             Self::Dense => '▓',
             Self::Classic => '-',
+            Self::Orbital => '•',
+            Self::Neon => '~',
+        }
+    }
+
+    fn cell_line_color(self) -> Color {
+        match self {
+            Self::Orbital => Color::Cyan,
+            Self::Neon => Color::LightCyan,
+            _ => CELL_LINE_COLOR,
+        }
+    }
+
+    fn bond_line_color(self) -> Color {
+        match self {
+            Self::Orbital => Color::LightMagenta,
+            Self::Neon => Color::LightYellow,
+            _ => BOND_LINE_COLOR,
         }
     }
 }
@@ -108,6 +148,7 @@ pub struct App {
     show_bonded_images: bool,
     bond_max_distance: f32, // absolute maximum bond length (angstrom)
     show_labels: bool,
+    show_orientation_gizmo: bool,
     render_theme: RenderTheme,
     selected_atom: usize,
     should_quit: bool,
@@ -148,7 +189,7 @@ impl App {
             roll: 0.0,
             zoom: 1.0,
             fov_deg: DEFAULT_FOV_DEG,
-            lock_fov_zoom: false,
+            lock_fov_zoom: true,
             pan: [0.0, 0.0],
             sphere_scale: 0.45,
             show_bonds: true,
@@ -157,7 +198,8 @@ impl App {
             show_boundary_images,
             show_bonded_images,
             bond_max_distance,
-            show_labels: false,
+            show_labels: true,
+            show_orientation_gizmo: true,
             render_theme: RenderTheme::Dense,
             selected_atom: 0,
             should_quit: false,
@@ -195,6 +237,7 @@ impl App {
             KeyCode::Char('N') => self.adjust_bond_max_distance(-4.0 * BOND_MAX_DISTANCE_STEP),
             KeyCode::Char('M') => self.adjust_bond_max_distance(4.0 * BOND_MAX_DISTANCE_STEP),
             KeyCode::Char('i') => self.snap_view_isometric(),
+            KeyCode::Char('v') => self.toggle_orientation_gizmo(),
             KeyCode::Char('g') => self.toggle_render_theme(),
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0, "a"),
@@ -283,8 +326,16 @@ impl App {
     }
 
     fn toggle_render_theme(&mut self) {
-        self.render_theme = self.render_theme.toggled();
+        self.render_theme = self.render_theme.next();
         self.status = format!("Render theme: {}", self.render_theme.label());
+    }
+
+    fn toggle_orientation_gizmo(&mut self) {
+        self.show_orientation_gizmo = !self.show_orientation_gizmo;
+        self.status = format!(
+            "Orientation gizmo: {}",
+            bool_label(self.show_orientation_gizmo)
+        );
     }
 
     fn adjust_bond_max_distance(&mut self, delta: f32) {
@@ -581,6 +632,10 @@ fn side_panel_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(format!("Bond max: {:.2} A", app.bond_max_distance)),
         Line::from(format!("Sphere scale: {:.2}", app.sphere_scale)),
+        Line::from(format!(
+            "Orientation gizmo: {}",
+            bool_label(app.show_orientation_gizmo)
+        )),
         Line::from(format!("Theme: {}", app.render_theme.label())),
         Line::from(""),
     ]);
@@ -613,7 +668,7 @@ fn side_panel_lines(app: &App) -> Vec<Line<'static>> {
 
 fn help_line() -> Line<'static> {
     Line::from(
-        "h/j/k/l rotate  u/o roll  +/- zoom  ,/. fov  z lock fov size  w/a/s/d pan  i isometric  [/] sphere  g theme  b bonds  c cell  x cell top  r boundary imgs  t bonded imgs  n/m bond max  Shift+A/B/C axis view  Shift+L labels  Tab atom  q quit",
+        "h/j/k/l rotate  u/o roll  +/- zoom  ,/. fov  z lock fov size  w/a/s/d pan  i isometric  [/] sphere  v axes  g theme  b bonds  c cell  x cell top  r boundary imgs  t bonded imgs  n/m bond max  Shift+A/B/C axis view  Shift+L labels  Tab atom  q quit",
     )
 }
 
@@ -621,6 +676,7 @@ fn bool_label(value: bool) -> &'static str {
     if value { "on" } else { "off" }
 }
 
+#[cfg(test)]
 fn render_viewport(app: &App, width: usize, height: usize) -> String {
     let viewport = render_viewport_buffer(app, width, height);
     to_text_grid(&viewport.chars, width, height)
@@ -707,7 +763,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 *start,
                 *end,
                 app.render_theme.cell_line_glyph(),
-                CELL_LINE_COLOR,
+                app.render_theme.cell_line_color(),
                 app.scene.center,
                 scale,
                 app.rotation,
@@ -732,7 +788,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 bond.start,
                 bond.end,
                 app.render_theme.bond_line_glyph(),
-                BOND_LINE_COLOR,
+                app.render_theme.bond_line_color(),
                 app.scene.center,
                 scale,
                 app.rotation,
@@ -804,7 +860,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         }
 
         let selected = atom.base_index == app.selected_atom && !atom.is_image;
-        let color = atom_color(element, selected, atom.is_image);
+        let color = atom_color(element, selected);
 
         for row in row0..=row1 {
             for col in col0..=col1 {
@@ -828,7 +884,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                     continue;
                 }
                 z_buffer[idx] = z_pixel;
-                chars[idx] = sphere_glyph(nx, ny, nz, selected, atom.is_image, app.render_theme);
+                chars[idx] = sphere_glyph(nx, ny, nz, selected, app.render_theme);
                 colors[idx] = color;
             }
         }
@@ -856,7 +912,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 *start,
                 *end,
                 app.render_theme.cell_line_glyph(),
-                CELL_LINE_COLOR,
+                app.render_theme.cell_line_color(),
                 app.scene.center,
                 scale,
                 app.rotation,
@@ -869,26 +925,25 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         }
     }
 
+    if app.show_orientation_gizmo {
+        draw_orientation_gizmo(
+            &mut chars,
+            &mut colors,
+            width,
+            height,
+            app.rotation,
+            app.roll,
+        );
+    }
+
     ViewportBuffer { chars, colors }
 }
 
 /// Lambert-shaded glyph for a sphere surface point.
 /// (nx, ny, nz) is the outward surface normal in camera space (nz > 0 faces viewer).
-fn sphere_glyph(
-    nx: f32,
-    ny: f32,
-    nz: f32,
-    selected: bool,
-    image: bool,
-    theme: RenderTheme,
-) -> char {
+fn sphere_glyph(nx: f32, ny: f32, nz: f32, selected: bool, theme: RenderTheme) -> char {
     let diffuse = (nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]).max(0.0);
-    let intensity = if image {
-        // Periodic images rendered dimmer so they read as "ghost" copies.
-        0.15 + 0.35 * diffuse
-    } else {
-        0.25 + 0.75 * diffuse
-    };
+    let intensity = 0.25 + 0.75 * diffuse;
     let ramp = theme.shade_ramp();
     let n = ramp.len() - 1;
     let idx = if selected {
@@ -932,7 +987,7 @@ fn display_radius(element: &str) -> f32 {
     }
 }
 
-fn atom_color(element: &str, selected: bool, image: bool) -> Color {
+fn atom_color(element: &str, selected: bool) -> Color {
     let mut rgb = match element {
         "H" => (255, 255, 255),
         "C" => (235, 235, 235),
@@ -958,22 +1013,10 @@ fn atom_color(element: &str, selected: bool, image: bool) -> Color {
         "Zn" => (152, 216, 255),
         _ => (224, 224, 224),
     };
-    if image {
-        rgb = scale_rgb(rgb, 0.75);
-    }
     if selected {
         rgb = blend_rgb(rgb, (255, 255, 255), 0.35);
     }
     Color::Rgb(rgb.0, rgb.1, rgb.2)
-}
-
-fn scale_rgb(rgb: (u8, u8, u8), factor: f32) -> (u8, u8, u8) {
-    let scale = factor.clamp(0.0, 1.0);
-    (
-        ((rgb.0 as f32) * scale).round() as u8,
-        ((rgb.1 as f32) * scale).round() as u8,
-        ((rgb.2 as f32) * scale).round() as u8,
-    )
 }
 
 fn blend_rgb(base: (u8, u8, u8), tint: (u8, u8, u8), tint_ratio: f32) -> (u8, u8, u8) {
@@ -986,6 +1029,147 @@ fn blend_rgb(base: (u8, u8, u8), tint: (u8, u8, u8), tint_ratio: f32) -> (u8, u8
     )
 }
 
+fn draw_orientation_gizmo(
+    chars: &mut [char],
+    colors: &mut [Color],
+    width: usize,
+    height: usize,
+    rotation: [f32; 2],
+    roll: f32,
+) {
+    if width < 8 || height < 6 {
+        return;
+    }
+
+    let radius = ORIENTATION_GIZMO_RADIUS_COLS;
+    let origin_col = ORIENTATION_GIZMO_MARGIN_COLS + radius;
+    let origin_row = ORIENTATION_GIZMO_MARGIN_ROWS + radius / CHAR_ASPECT;
+    if origin_col >= (width.saturating_sub(1)) as f32
+        || origin_row >= (height.saturating_sub(1)) as f32
+    {
+        return;
+    }
+
+    let mut axes = [
+        (
+            'x',
+            AXIS_X_COLOR,
+            rotate_z(
+                rotate_y(rotate_x([1.0, 0.0, 0.0], rotation[0]), rotation[1]),
+                roll,
+            ),
+        ),
+        (
+            'y',
+            AXIS_Y_COLOR,
+            rotate_z(
+                rotate_y(rotate_x([0.0, 1.0, 0.0], rotation[0]), rotation[1]),
+                roll,
+            ),
+        ),
+        (
+            'z',
+            AXIS_Z_COLOR,
+            rotate_z(
+                rotate_y(rotate_x([0.0, 0.0, 1.0], rotation[0]), rotation[1]),
+                roll,
+            ),
+        ),
+    ];
+    // Draw farther axes first so nearer axes remain readable.
+    axes.sort_by(|a, b| b.2[2].partial_cmp(&a.2[2]).unwrap_or(Ordering::Equal));
+
+    for (label, color, axis) in axes {
+        draw_orientation_axis(
+            chars, colors, width, height, origin_col, origin_row, radius, label, color, axis,
+        );
+    }
+    put_colored_char(
+        chars,
+        colors,
+        width,
+        height,
+        origin_col.round() as isize,
+        origin_row.round() as isize,
+        '+',
+        Color::Gray,
+    );
+}
+
+fn draw_orientation_axis(
+    chars: &mut [char],
+    colors: &mut [Color],
+    width: usize,
+    height: usize,
+    origin_col: f32,
+    origin_row: f32,
+    radius: f32,
+    label: char,
+    color: Color,
+    axis_cam: [f32; 3],
+) {
+    let dx = axis_cam[0] * radius;
+    let dy = -axis_cam[1] * radius / CHAR_ASPECT;
+    let physical_len = dx.abs().max(dy.abs() * CHAR_ASPECT);
+    let steps = (physical_len.ceil() as usize).clamp(1, 48);
+
+    for step in 1..=steps {
+        let t = step as f32 / steps as f32;
+        let col = origin_col + dx * t;
+        let row = origin_row + dy * t;
+        put_colored_char(
+            chars,
+            colors,
+            width,
+            height,
+            col.round() as isize,
+            row.round() as isize,
+            '.',
+            color,
+        );
+    }
+
+    let (label_dx, label_dy) = if physical_len > 1e-3 {
+        (dx * 1.2, dy * 1.2)
+    } else {
+        match label {
+            'x' => (radius * 0.7, 0.0),
+            'y' => (0.0, -radius * 0.7 / CHAR_ASPECT),
+            _ => (-radius * 0.5, -radius * 0.5 / CHAR_ASPECT),
+        }
+    };
+
+    put_colored_char(
+        chars,
+        colors,
+        width,
+        height,
+        (origin_col + label_dx).round() as isize,
+        (origin_row + label_dy).round() as isize,
+        label,
+        color,
+    );
+}
+
+fn put_colored_char(
+    chars: &mut [char],
+    colors: &mut [Color],
+    width: usize,
+    height: usize,
+    col: isize,
+    row: isize,
+    glyph: char,
+    color: Color,
+) {
+    if col < 0 || row < 0 || col >= width as isize || row >= height as isize {
+        return;
+    }
+    let idx = row as usize * width + col as usize;
+    chars[idx] = glyph;
+    colors[idx] = color;
+}
+
+#[cfg(test)]
 fn to_text_grid(chars: &[char], width: usize, height: usize) -> String {
     let mut out = String::with_capacity((width + 1) * height);
     for y in 0..height {
@@ -1545,8 +1729,6 @@ mod tests {
         let cif = include_str!("../Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
         let mut app = App::new(structure);
-
-        app.handle_key_press(KeyCode::Char('z'));
         assert!(app.lock_fov_zoom);
 
         let old_fov = app.fov_deg;
@@ -1766,7 +1948,76 @@ mod tests {
         assert_eq!(app.render_theme, RenderTheme::Classic);
 
         app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Orbital);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Neon);
+
+        app.handle_key_press(KeyCode::Char('g'));
         assert_eq!(app.render_theme, RenderTheme::Dense);
+    }
+
+    #[test]
+    fn toggles_orientation_gizmo_mode() {
+        let structure = Structure {
+            title: "gizmo toggle test".to_string(),
+            atoms: vec![],
+            cell: None,
+        };
+        let mut app = App::new(structure);
+        assert!(app.show_orientation_gizmo);
+
+        app.handle_key_press(KeyCode::Char('v'));
+        assert!(!app.show_orientation_gizmo);
+
+        app.handle_key_press(KeyCode::Char('v'));
+        assert!(app.show_orientation_gizmo);
+    }
+
+    #[test]
+    fn labels_are_enabled_by_default_and_toggle() {
+        let structure = Structure {
+            title: "labels toggle test".to_string(),
+            atoms: vec![],
+            cell: None,
+        };
+        let mut app = App::new(structure);
+        assert!(app.show_labels);
+
+        app.handle_key_press(KeyCode::Char('L'));
+        assert!(!app.show_labels);
+
+        app.handle_key_press(KeyCode::Char('L'));
+        assert!(app.show_labels);
+    }
+
+    #[test]
+    fn orientation_gizmo_renders_xyz_labels_and_can_be_hidden() {
+        let structure = Structure {
+            title: "gizmo render test".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+        };
+        let mut app = App::new(structure);
+        app.show_bonds = false;
+        app.show_cell = false;
+        app.show_labels = false;
+
+        let with_gizmo = render_viewport(&app, 60, 20);
+        assert!(with_gizmo.contains('x'));
+        assert!(with_gizmo.contains('y'));
+        assert!(with_gizmo.contains('z'));
+
+        app.handle_key_press(KeyCode::Char('v'));
+        let without_gizmo = render_viewport(&app, 60, 20);
+        assert!(!without_gizmo.contains('x'));
+        assert!(!without_gizmo.contains('y'));
+        assert!(!without_gizmo.contains('z'));
     }
 
     #[test]
@@ -1902,7 +2153,7 @@ mod tests {
     }
 
     #[test]
-    fn toggling_cell_keeps_atom_pixels_and_glyphs_stable_for_fe_fixture() {
+    fn toggling_cell_for_fe_fixture_only_replaces_pixels_with_cell_glyph() {
         let cif = include_str!("../Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
 
@@ -1919,20 +2170,24 @@ mod tests {
         let with_cell_chars = flatten_grid(&with_cell_buf);
         let without_cell_chars = flatten_grid(&without_cell_buf);
         assert_eq!(with_cell_chars.len(), without_cell_chars.len());
+        let cell_glyph = with_cell.render_theme.cell_line_glyph();
 
         for (idx, ch) in without_cell_chars.iter().enumerate() {
             if *ch != ' ' {
-                assert_eq!(
-                    *ch, with_cell_chars[idx],
-                    "Fe.cif atom glyph changed at pixel index {idx}: off='{}' on='{}'",
-                    *ch, with_cell_chars[idx]
-                );
+                let with_ch = with_cell_chars[idx];
+                if with_ch != *ch {
+                    assert_eq!(
+                        with_ch, cell_glyph,
+                        "Fe.cif unexpected glyph replacement at pixel index {idx}: off='{}' on='{}'",
+                        *ch, with_ch
+                    );
+                }
             }
         }
     }
 
     #[test]
-    fn toggling_cell_keeps_atom_pixels_and_glyphs_stable_for_fe_fixture_with_bonds() {
+    fn toggling_cell_with_bonds_for_fe_fixture_only_replaces_pixels_with_cell_glyph() {
         let cif = include_str!("../Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
 
@@ -1949,14 +2204,18 @@ mod tests {
         let with_cell_chars = flatten_grid(&with_cell_buf);
         let without_cell_chars = flatten_grid(&without_cell_buf);
         assert_eq!(with_cell_chars.len(), without_cell_chars.len());
+        let cell_glyph = with_cell.render_theme.cell_line_glyph();
 
         for (idx, ch) in without_cell_chars.iter().enumerate() {
             if *ch != ' ' {
-                assert_eq!(
-                    *ch, with_cell_chars[idx],
-                    "Fe.cif (+bonds) atom glyph changed at pixel index {idx}: off='{}' on='{}'",
-                    *ch, with_cell_chars[idx]
-                );
+                let with_ch = with_cell_chars[idx];
+                if with_ch != *ch {
+                    assert_eq!(
+                        with_ch, cell_glyph,
+                        "Fe.cif (+bonds) unexpected glyph replacement at pixel index {idx}: off='{}' on='{}'",
+                        *ch, with_ch
+                    );
+                }
             }
         }
     }

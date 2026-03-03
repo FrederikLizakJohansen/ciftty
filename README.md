@@ -16,5 +16,6 @@ cargo run -- path/to/structure.cif
 - `r` boundary-repeat atoms, `t` bonded outside-cell atoms
 - `n/m` max bond length (`Shift+N/M` larger step)
 - `i` isometric, `Shift+A/B/C` axis views
-- `g` toggle render theme (`dense`/`classic`)
+- `v` toggle orientation gizmo (`x/y/z` RGB axes)
+- `g` cycle render theme (`dense`/`classic`/`orbital`/`neon`)
 - `Tab` select atom, `Shift+L` labels, `q` quit
