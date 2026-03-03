@@ -37,13 +37,58 @@ const DEFAULT_BOND_MAX_DISTANCE: f32 = 2.2;
 const MIN_BOND_MAX_DISTANCE: f32 = 0.0;
 const MAX_BOND_MAX_DISTANCE: f32 = 12.0;
 const BOND_MAX_DISTANCE_STEP: f32 = 0.10;
-// Shading ramp from dark to bright (spec §6).
-const SHADE_RAMP: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+// Classic ASCII shading ramp from dark to bright (spec §6).
+const SHADE_RAMP_CLASSIC: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
+// Dense shading ramp from dark to bright; this fills terminal rows better.
+const SHADE_RAMP_DENSE: &[char] = &[' ', '░', '▒', '▓', '█'];
 // Lambert light direction (normalized below in sphere_glyph).
 const LIGHT: [f32; 3] = [0.268, 0.358, 0.894]; // normalize([0.3, 0.4, 1.0])
 const CELL_LINE_COLOR: Color = Color::White;
 const BOND_LINE_COLOR: Color = Color::Gray;
 const LABEL_COLOR: Color = Color::White;
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum RenderTheme {
+    Dense,
+    Classic,
+}
+
+impl RenderTheme {
+    fn toggled(self) -> Self {
+        match self {
+            Self::Dense => Self::Classic,
+            Self::Classic => Self::Dense,
+        }
+    }
+
+    fn label(self) -> &'static str {
+        match self {
+            Self::Dense => "dense",
+            Self::Classic => "classic",
+        }
+    }
+
+    fn shade_ramp(self) -> &'static [char] {
+        match self {
+            Self::Dense => SHADE_RAMP_DENSE,
+            Self::Classic => SHADE_RAMP_CLASSIC,
+        }
+    }
+
+    fn cell_line_glyph(self) -> char {
+        match self {
+            Self::Dense => '▒',
+            Self::Classic => ':',
+        }
+    }
+
+    fn bond_line_glyph(self) -> char {
+        match self {
+            Self::Dense => '▓',
+            Self::Classic => '-',
+        }
+    }
+}
 
 pub struct App {
     structure: Structure,
@@ -63,6 +108,7 @@ pub struct App {
     show_bonded_images: bool,
     bond_max_distance: f32, // absolute maximum bond length (angstrom)
     show_labels: bool,
+    render_theme: RenderTheme,
     selected_atom: usize,
     should_quit: bool,
     status: String,
@@ -112,6 +158,7 @@ impl App {
             show_bonded_images,
             bond_max_distance,
             show_labels: false,
+            render_theme: RenderTheme::Dense,
             selected_atom: 0,
             should_quit: false,
             status,
@@ -148,6 +195,7 @@ impl App {
             KeyCode::Char('N') => self.adjust_bond_max_distance(-4.0 * BOND_MAX_DISTANCE_STEP),
             KeyCode::Char('M') => self.adjust_bond_max_distance(4.0 * BOND_MAX_DISTANCE_STEP),
             KeyCode::Char('i') => self.snap_view_isometric(),
+            KeyCode::Char('g') => self.toggle_render_theme(),
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0, "a"),
             KeyCode::Char('B') => self.snap_view_to_lattice_axis(1, "b"),
@@ -232,6 +280,11 @@ impl App {
     fn toggle_cell_on_top(&mut self) {
         self.cell_on_top = !self.cell_on_top;
         self.status = format!("Cell overlay: {}", bool_label(self.cell_on_top));
+    }
+
+    fn toggle_render_theme(&mut self) {
+        self.render_theme = self.render_theme.toggled();
+        self.status = format!("Render theme: {}", self.render_theme.label());
     }
 
     fn adjust_bond_max_distance(&mut self, delta: f32) {
@@ -528,6 +581,7 @@ fn side_panel_lines(app: &App) -> Vec<Line<'static>> {
         )),
         Line::from(format!("Bond max: {:.2} A", app.bond_max_distance)),
         Line::from(format!("Sphere scale: {:.2}", app.sphere_scale)),
+        Line::from(format!("Theme: {}", app.render_theme.label())),
         Line::from(""),
     ]);
 
@@ -559,7 +613,7 @@ fn side_panel_lines(app: &App) -> Vec<Line<'static>> {
 
 fn help_line() -> Line<'static> {
     Line::from(
-        "h/j/k/l rotate  u/o roll  +/- zoom  ,/. fov  z lock fov size  w/a/s/d pan  i isometric  [/] sphere  b bonds  c cell  x cell top  r boundary imgs  t bonded imgs  n/m bond max  Shift+A/B/C axis view  Shift+L labels  Tab atom  q quit",
+        "h/j/k/l rotate  u/o roll  +/- zoom  ,/. fov  z lock fov size  w/a/s/d pan  i isometric  [/] sphere  g theme  b bonds  c cell  x cell top  r boundary imgs  t bonded imgs  n/m bond max  Shift+A/B/C axis view  Shift+L labels  Tab atom  q quit",
     )
 }
 
@@ -580,6 +634,39 @@ fn render_viewport_text(app: &App, width: usize, height: usize) -> Text<'static>
 struct ViewportBuffer {
     chars: Vec<char>,
     colors: Vec<Color>,
+}
+
+#[derive(Clone, Copy, Debug)]
+struct ViewportTransform {
+    center_col: f32,
+    center_row: f32,
+    // Physical scale in "column-width pixels" for one projected unit.
+    units_to_cols: f32,
+}
+
+impl ViewportTransform {
+    fn for_size(width: usize, height: usize) -> Option<Self> {
+        if width == 0 || height == 0 {
+            return None;
+        }
+        let center_col = (width.saturating_sub(1)) as f32 * 0.5;
+        let center_row = (height.saturating_sub(1)) as f32 * 0.5;
+        let half_w = center_col;
+        let half_h_phys = center_row * CHAR_ASPECT;
+        let units_to_cols = half_w.min(half_h_phys);
+        Some(Self {
+            center_col,
+            center_row,
+            units_to_cols,
+        })
+    }
+
+    fn screen_position(self, x: f32, y: f32) -> (f32, f32) {
+        (
+            self.center_col + x * self.units_to_cols,
+            self.center_row - y * self.units_to_cols / CHAR_ASPECT,
+        )
+    }
 }
 
 fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuffer {
@@ -604,6 +691,9 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
     let mut colors = vec![Color::Reset; width * height];
     let mut z_buffer = vec![f32::INFINITY; width * height];
     let scale = app.base_scale * app.zoom;
+    let Some(viewport) = ViewportTransform::for_size(width, height) else {
+        return ViewportBuffer { chars, colors };
+    };
 
     if app.show_cell && !app.cell_on_top {
         for (start, end) in &app.scene.cell_edges {
@@ -613,9 +703,10 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 &mut z_buffer,
                 width,
                 height,
+                viewport,
                 *start,
                 *end,
-                ':',
+                app.render_theme.cell_line_glyph(),
                 CELL_LINE_COLOR,
                 app.scene.center,
                 scale,
@@ -637,9 +728,10 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 &mut z_buffer,
                 width,
                 height,
+                viewport,
                 bond.start,
                 bond.end,
-                '-',
+                app.render_theme.bond_line_glyph(),
                 BOND_LINE_COLOR,
                 app.scene.center,
                 scale,
@@ -655,8 +747,6 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
 
     // Rasterize atoms as sphere disks, back-to-front so the z-buffer correctly
     // resolves overlaps even at equal depth (painter's order as tie-breaker).
-    let half_w = (width.saturating_sub(1)) as f32 * 0.5;
-
     let mut atoms_projected: Vec<(&RenderAtom, ProjectedPoint)> = app
         .scene
         .atoms
@@ -691,14 +781,13 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         let r_world = display_radius(element) * app.sphere_scale;
         // Projected radius in column units (x screen axis).
         let r_depth = r_world * scale;
-        let r_screen = (r_depth * p.screen_scale * half_w).max(0.5);
+        let r_screen = (r_depth * p.screen_scale * viewport.units_to_cols).max(0.5);
         if !r_screen.is_finite() {
             continue;
         }
 
         // Sphere center in screen pixel coords.
-        let cx = (p.x + 1.0) * half_w;
-        let cy = (1.0 - (p.y + 1.0) * 0.5) * (height.saturating_sub(1)) as f32;
+        let (cx, cy) = viewport.screen_position(p.x, p.y);
         if !cx.is_finite() || !cy.is_finite() {
             continue;
         }
@@ -739,7 +828,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                     continue;
                 }
                 z_buffer[idx] = z_pixel;
-                chars[idx] = sphere_glyph(nx, ny, nz, selected, atom.is_image);
+                chars[idx] = sphere_glyph(nx, ny, nz, selected, atom.is_image, app.render_theme);
                 colors[idx] = color;
             }
         }
@@ -763,9 +852,10 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 &mut z_buffer,
                 width,
                 height,
+                viewport,
                 *start,
                 *end,
-                ':',
+                app.render_theme.cell_line_glyph(),
                 CELL_LINE_COLOR,
                 app.scene.center,
                 scale,
@@ -784,7 +874,14 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
 
 /// Lambert-shaded glyph for a sphere surface point.
 /// (nx, ny, nz) is the outward surface normal in camera space (nz > 0 faces viewer).
-fn sphere_glyph(nx: f32, ny: f32, nz: f32, selected: bool, image: bool) -> char {
+fn sphere_glyph(
+    nx: f32,
+    ny: f32,
+    nz: f32,
+    selected: bool,
+    image: bool,
+    theme: RenderTheme,
+) -> char {
     let diffuse = (nx * LIGHT[0] + ny * LIGHT[1] + nz * LIGHT[2]).max(0.0);
     let intensity = if image {
         // Periodic images rendered dimmer so they read as "ghost" copies.
@@ -792,14 +889,15 @@ fn sphere_glyph(nx: f32, ny: f32, nz: f32, selected: bool, image: bool) -> char 
     } else {
         0.25 + 0.75 * diffuse
     };
-    let n = SHADE_RAMP.len() - 1;
+    let ramp = theme.shade_ramp();
+    let n = ramp.len() - 1;
     let idx = if selected {
         // Selected atoms are forced into the bright half of the ramp.
         ((0.5 + 0.5 * diffuse) * n as f32) as usize
     } else {
         (intensity * n as f32) as usize
     };
-    SHADE_RAMP[idx.min(n)]
+    ramp[idx.min(n)]
 }
 
 /// Visual display radius (Å) used for sphere rasterization.
@@ -936,6 +1034,7 @@ fn rasterize_segment(
     z_buffer: &mut [f32],
     width: usize,
     height: usize,
+    viewport: ViewportTransform,
     start: [f32; 3],
     end: [f32; 3],
     glyph: char,
@@ -956,9 +1055,11 @@ fn rasterize_segment(
         return;
     };
 
-    let samples = (((p1.x - p0.x).abs().max((p1.y - p0.y).abs()) * width.max(height) as f32).ceil()
-        as usize)
-        .clamp(2, 600);
+    let (x0, y0) = viewport.screen_position(p0.x, p0.y);
+    let (x1, y1) = viewport.screen_position(p1.x, p1.y);
+    // Approximate segment length in physical "column-width pixels".
+    let segment_len = (x1 - x0).abs().max((y1 - y0).abs() * CHAR_ASPECT);
+    let samples = (segment_len.ceil() as usize).clamp(2, 600);
 
     for step in 0..=samples {
         let t = step as f32 / samples as f32;
@@ -966,7 +1067,7 @@ fn rasterize_segment(
         let y = p0.y + (p1.y - p0.y) * t;
         // Keep helper geometry behind atom points at identical depth.
         let z = p0.z + (p1.z - p0.z) * t + depth_bias;
-        if let Some((sx, sy)) = screen_coords(x, y, width, height) {
+        if let Some((sx, sy)) = screen_coords(x, y, width, height, viewport) {
             let idx = sy * width + sx;
             if overlay {
                 chars[idx] = glyph;
@@ -983,13 +1084,19 @@ fn rasterize_segment(
     }
 }
 
-fn screen_coords(x: f32, y: f32, width: usize, height: usize) -> Option<(usize, usize)> {
+fn screen_coords(
+    x: f32,
+    y: f32,
+    width: usize,
+    height: usize,
+    viewport: ViewportTransform,
+) -> Option<(usize, usize)> {
     if !x.is_finite() || !y.is_finite() {
         return None;
     }
-
-    let sx = ((x + 1.0) * 0.5 * ((width - 1) as f32)).round();
-    let sy = ((1.0 - (y + 1.0) * 0.5) * ((height - 1) as f32)).round();
+    let (sx, sy) = viewport.screen_position(x, y);
+    let sx = sx.round();
+    let sy = sy.round();
     if !sx.is_finite() || !sy.is_finite() {
         return None;
     }
@@ -1380,9 +1487,9 @@ fn rotate_z(p: [f32; 3], angle: f32) -> [f32; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MIN_FOV_DEG,
-        best_image_shift_and_distance, boundary_axis_shifts, build_scene, project_world,
-        render_viewport, transform_world,
+        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MIN_FOV_DEG, RenderTheme,
+        ViewportTransform, best_image_shift_and_distance, boundary_axis_shifts, build_scene,
+        project_world, render_viewport, transform_world,
     };
     use crate::cif::parse_cif_str;
     use crate::model::{Atom, Cell, Structure};
@@ -1643,6 +1750,44 @@ mod tests {
 
         app.handle_key_press(KeyCode::Char('x'));
         assert!(!app.cell_on_top);
+    }
+
+    #[test]
+    fn toggles_render_theme_mode() {
+        let structure = Structure {
+            title: "theme test".to_string(),
+            atoms: vec![],
+            cell: None,
+        };
+        let mut app = App::new(structure);
+        assert_eq!(app.render_theme, RenderTheme::Dense);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Classic);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Dense);
+    }
+
+    #[test]
+    fn viewport_transform_uses_equal_physical_scale_for_x_and_y() {
+        for (width, height) in [(120, 24), (40, 60), (70, 30)] {
+            let viewport = ViewportTransform::for_size(width, height)
+                .expect("non-zero viewport should produce a transform");
+            let (cx, cy) = viewport.screen_position(0.0, 0.0);
+            let (x, _) = viewport.screen_position(0.6, 0.0);
+            let (_, y) = viewport.screen_position(0.0, 0.6);
+            let dx = (x - cx).abs();
+            let dy_phys = (y - cy).abs() * CHAR_ASPECT;
+            assert!(
+                (dx - dy_phys).abs() < 1e-4,
+                "physical x/y scale mismatch for {}x{} viewport: dx={}, dy_phys={}",
+                width,
+                height,
+                dx,
+                dy_phys
+            );
+        }
     }
 
     #[test]
