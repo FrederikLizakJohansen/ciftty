@@ -125,6 +125,7 @@ pub struct Structure {
     pub title: String,
     pub atoms: Vec<Atom>,
     pub cell: Option<Cell>,
+    pub space_group: Option<String>,
 }
 
 impl Structure {

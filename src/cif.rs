@@ -68,6 +68,7 @@ pub fn parse_cif_str(input: &str, fallback_title: &str) -> Result<Structure> {
     let lines: Vec<&str> = input.lines().collect();
     let mut title = fallback_title.to_string();
     let mut cell = CellParams::default();
+    let mut space_group: Option<String> = None;
     let mut parsed_atoms: Vec<ParsedAtom> = Vec::new();
     let mut symmetry_ops: Vec<String> = Vec::new();
     let mut i = 0usize;
@@ -88,15 +89,34 @@ pub fn parse_cif_str(input: &str, fallback_title: &str) -> Result<Structure> {
             continue;
         }
 
-        if line.starts_with("_cell_") {
+        if line.starts_with('_') {
             let tokens = tokenize_row(line);
             if tokens.len() >= 2 {
-                if let Some(value) = parse_cif_number(&tokens[1]) {
-                    cell.update(&tokens[0].to_ascii_lowercase(), value);
+                let tag = tokens[0].to_ascii_lowercase();
+                if tag.starts_with("_cell_") {
+                    if let Some(value) = parse_cif_number(&tokens[1]) {
+                        cell.update(&tag, value);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if is_space_group_name_tag(&tag) {
+                    if let Some(value) = parse_tag_value(&tokens[1..]) {
+                        space_group = Some(value);
+                    }
+                    i += 1;
+                    continue;
+                }
+                if is_space_group_number_tag(&tag) {
+                    if let Some(value) = parse_tag_value(&tokens[1..]) {
+                        if space_group.is_none() {
+                            space_group = Some(format!("#{}", value));
+                        }
+                    }
+                    i += 1;
+                    continue;
                 }
             }
-            i += 1;
-            continue;
         }
 
         if line.eq_ignore_ascii_case("loop_") {
@@ -165,7 +185,39 @@ pub fn parse_cif_str(input: &str, fallback_title: &str) -> Result<Structure> {
         title,
         atoms,
         cell: cell_model,
+        space_group,
     })
+}
+
+fn is_space_group_name_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "_symmetry_space_group_name_h-m"
+            | "_space_group_name_h-m_alt"
+            | "_space_group_name_h-m_full"
+            | "_space_group_name_h-m_ref"
+            | "_space_group_name_hall"
+    )
+}
+
+fn is_space_group_number_tag(tag: &str) -> bool {
+    matches!(
+        tag,
+        "_space_group_it_number" | "_symmetry_int_tables_number"
+    )
+}
+
+fn parse_tag_value(tokens: &[String]) -> Option<String> {
+    if tokens.is_empty() {
+        return None;
+    }
+    let joined = tokens.join(" ");
+    let trimmed = joined.trim().trim_matches('\'').trim_matches('"').trim();
+    if trimmed.is_empty() || trimmed == "?" || trimmed == "." {
+        None
+    } else {
+        Some(trimmed.to_string())
+    }
 }
 
 fn is_symmetry_operation_header(header: &str) -> bool {

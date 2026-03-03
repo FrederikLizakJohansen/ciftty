@@ -17,5 +17,5 @@ cargo run -- path/to/structure.cif
 - `n/m` max bond length (`Shift+N/M` larger step)
 - `i` isometric, `Shift+A/B/C` axis views
 - `v` toggle orientation gizmo (`x/y/z` RGB axes)
-- `g` cycle render theme (`dense`/`classic`/`orbital`/`neon`)
-- `Tab` select atom, `Shift+L` labels, `q` quit
+- `g` cycle render theme (`dense`/`classic`/`orbital`/`neon`, default: `orbital`)
+- `Tab` select atom, `Shift+L` labels (default: on), `q` quit

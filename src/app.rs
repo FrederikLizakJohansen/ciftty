@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::io::Stdout;
 use std::time::Duration;
 
@@ -10,7 +10,7 @@ use crossterm::event::{
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout};
-use ratatui::style::{Color, Style};
+use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
 
@@ -152,7 +152,6 @@ pub struct App {
     render_theme: RenderTheme,
     selected_atom: usize,
     should_quit: bool,
-    status: String,
     /// Column/row of the last mouse-drag position, for delta calculation.
     drag_last: Option<(u16, u16)>,
 }
@@ -168,17 +167,6 @@ impl App {
             show_bonded_images,
             bond_max_distance,
         );
-        let status = if scene.periodic_enabled {
-            format!(
-                "{} base + {} periodic image atoms, {} bonds",
-                structure.atoms.len(),
-                scene.image_atom_count,
-                scene.bonds.len()
-            )
-        } else {
-            "Loaded structure (periodic expansion unavailable)".to_string()
-        };
-
         let base_scale = bounding_sphere_scale(&scene);
         Self {
             structure,
@@ -200,10 +188,9 @@ impl App {
             bond_max_distance,
             show_labels: true,
             show_orientation_gizmo: true,
-            render_theme: RenderTheme::Dense,
+            render_theme: RenderTheme::Orbital,
             selected_atom: 0,
             should_quit: false,
-            status,
             drag_last: None,
         }
     }
@@ -240,9 +227,9 @@ impl App {
             KeyCode::Char('v') => self.toggle_orientation_gizmo(),
             KeyCode::Char('g') => self.toggle_render_theme(),
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
-            KeyCode::Char('A') => self.snap_view_to_lattice_axis(0, "a"),
-            KeyCode::Char('B') => self.snap_view_to_lattice_axis(1, "b"),
-            KeyCode::Char('C') => self.snap_view_to_lattice_axis(2, "c"),
+            KeyCode::Char('A') => self.snap_view_to_lattice_axis(0),
+            KeyCode::Char('B') => self.snap_view_to_lattice_axis(1),
+            KeyCode::Char('C') => self.snap_view_to_lattice_axis(2),
             KeyCode::Tab => {
                 if !self.structure.atoms.is_empty() {
                     self.selected_atom = (self.selected_atom + 1) % self.structure.atoms.len();
@@ -295,47 +282,28 @@ impl App {
 
     fn toggle_fov_zoom_lock(&mut self) {
         self.lock_fov_zoom = !self.lock_fov_zoom;
-        self.status = if self.lock_fov_zoom {
-            "FOV size lock: on".to_string()
-        } else {
-            "FOV size lock: off".to_string()
-        };
     }
 
     fn toggle_boundary_images(&mut self) {
         self.show_boundary_images = !self.show_boundary_images;
         self.rebuild_scene();
-        self.status = format!(
-            "Boundary repeats: {}",
-            bool_label(self.show_boundary_images)
-        );
     }
 
     fn toggle_bonded_images(&mut self) {
         self.show_bonded_images = !self.show_bonded_images;
         self.rebuild_scene();
-        self.status = format!(
-            "Bonded outside-cell atoms: {}",
-            bool_label(self.show_bonded_images)
-        );
     }
 
     fn toggle_cell_on_top(&mut self) {
         self.cell_on_top = !self.cell_on_top;
-        self.status = format!("Cell overlay: {}", bool_label(self.cell_on_top));
     }
 
     fn toggle_render_theme(&mut self) {
         self.render_theme = self.render_theme.next();
-        self.status = format!("Render theme: {}", self.render_theme.label());
     }
 
     fn toggle_orientation_gizmo(&mut self) {
         self.show_orientation_gizmo = !self.show_orientation_gizmo;
-        self.status = format!(
-            "Orientation gizmo: {}",
-            bool_label(self.show_orientation_gizmo)
-        );
     }
 
     fn adjust_bond_max_distance(&mut self, delta: f32) {
@@ -346,7 +314,6 @@ impl App {
             return;
         }
         self.rebuild_scene();
-        self.status = format!("Bond max distance: {:.2} A", self.bond_max_distance);
     }
 
     fn rebuild_scene(&mut self) {
@@ -455,7 +422,7 @@ impl App {
         Some(0.5 * (low + high))
     }
 
-    fn snap_view_to_lattice_axis(&mut self, axis_index: usize, axis_name: &str) {
+    fn snap_view_to_lattice_axis(&mut self, axis_index: usize) {
         let axis = if let Some(cell) = self.structure.cell {
             cell.lattice[axis_index]
         } else {
@@ -477,14 +444,12 @@ impl App {
         self.rotation = [pitch, yaw];
         self.roll = 0.0;
         self.pan = [0.0, 0.0];
-        self.status = format!("View: down {} axis", axis_name);
     }
 
     fn snap_view_isometric(&mut self) {
         self.rotation = [ISO_PITCH, ISO_YAW];
         self.roll = 0.0;
         self.pan = [0.0, 0.0];
-        self.status = "View: isometric".to_string();
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
@@ -543,137 +508,422 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, structure: Structu
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
     let root = Layout::default()
-        .direction(Direction::Vertical)
-        .constraints([Constraint::Min(5), Constraint::Length(3)])
+        .direction(Direction::Horizontal)
+        .constraints([Constraint::Min(24), Constraint::Length(44)])
         .split(area);
 
-    let top = Layout::default()
-        .direction(Direction::Horizontal)
-        .constraints([Constraint::Min(20), Constraint::Length(36)])
-        .split(root[0]);
+    let right = Layout::default()
+        .direction(Direction::Vertical)
+        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .split(root[1]);
 
     let viewport = render_viewport_text(
         app,
-        top[0].width.saturating_sub(2) as usize,
-        top[0].height.saturating_sub(2) as usize,
+        root[0].width.saturating_sub(2) as usize,
+        root[0].height.saturating_sub(2) as usize,
     );
     let viewport_paragraph =
         Paragraph::new(viewport).block(Block::default().borders(Borders::ALL).title("3D View"));
-    frame.render_widget(viewport_paragraph, top[0]);
+    frame.render_widget(viewport_paragraph, root[0]);
 
-    let side = Paragraph::new(side_panel_lines(app))
+    let side = Paragraph::new(structure_panel_lines(app))
         .block(Block::default().borders(Borders::ALL).title("Structure"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(side, top[1]);
+    frame.render_widget(side, right[0]);
 
-    let help = Paragraph::new(help_line())
-        .block(Block::default().borders(Borders::ALL).title("Keys"))
+    let view_panel = Paragraph::new(controls_keys_panel_lines(app))
+        .block(Block::default().borders(Borders::ALL).title("Controls"))
         .wrap(Wrap { trim: true });
-    frame.render_widget(help, root[1]);
+    frame.render_widget(view_panel, right[1]);
 }
 
-fn side_panel_lines(app: &App) -> Vec<Line<'static>> {
+fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     let selected = app.structure.atoms.get(app.selected_atom);
+    let total_atoms = app.structure.atoms.len();
+    let element_counts = element_counts(&app.structure.atoms);
+    let formula = empirical_formula(&element_counts);
+
     let mut lines = vec![
-        Line::from(format!("Title: {}", app.structure.title)),
-        Line::from(format!(
-            "Base atoms: {}   Rendered: {}",
-            app.structure.atoms.len(),
-            app.scene.atoms.len()
-        )),
-        Line::from(format!(
-            "Periodic image atoms: {}",
-            app.scene.image_atom_count
-        )),
-        Line::from(format!("Bonds: {}", app.scene.bonds.len())),
+        kv_line(
+            "Title",
+            app.structure.title.clone(),
+            Color::Cyan,
+            Color::White,
+        ),
+        kv_line("Formula", formula, Color::Cyan, Color::LightYellow),
+        elements_line(&element_counts),
+        kv_line(
+            "Atom sites",
+            total_atoms.to_string(),
+            Color::Cyan,
+            Color::LightGreen,
+        ),
+        kv_line(
+            "Space group",
+            app.structure
+                .space_group
+                .clone()
+                .unwrap_or_else(|| "unknown".to_string()),
+            Color::Cyan,
+            Color::LightBlue,
+        ),
+        Line::default(),
     ];
 
     if let Some(cell) = app.structure.cell {
-        lines.push(Line::from("Cell: yes"));
-        lines.push(Line::from(format!(
-            "a {:.3}  b {:.3}  c {:.3}",
-            cell.a, cell.b, cell.c
-        )));
-        lines.push(Line::from(format!(
-            "al {:.1}  be {:.1}  ga {:.1}",
-            cell.alpha_deg, cell.beta_deg, cell.gamma_deg
-        )));
+        lines.push(Line::from(vec![
+            Span::styled("a ", Style::default().fg(Color::Red)),
+            Span::styled(format!("{:.3}", cell.a), Style::default().fg(Color::White)),
+            Span::styled("  b ", Style::default().fg(Color::Green)),
+            Span::styled(format!("{:.3}", cell.b), Style::default().fg(Color::White)),
+            Span::styled("  c ", Style::default().fg(Color::Blue)),
+            Span::styled(format!("{:.3}", cell.c), Style::default().fg(Color::White)),
+            Span::styled(" A", Style::default().fg(Color::Gray)),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("alpha ", Style::default().fg(Color::LightRed)),
+            Span::styled(
+                format!("{:.1}", cell.alpha_deg),
+                Style::default().fg(Color::LightYellow),
+            ),
+            Span::styled("  beta ", Style::default().fg(Color::LightGreen)),
+            Span::styled(
+                format!("{:.1}", cell.beta_deg),
+                Style::default().fg(Color::LightYellow),
+            ),
+            Span::styled("  gamma ", Style::default().fg(Color::LightBlue)),
+            Span::styled(
+                format!("{:.1}", cell.gamma_deg),
+                Style::default().fg(Color::LightYellow),
+            ),
+            Span::styled(" deg", Style::default().fg(Color::Gray)),
+        ]));
+        lines.push(kv_line(
+            "Volume",
+            format!("{:.3} A^3", cell_volume(cell)),
+            Color::Cyan,
+            Color::LightCyan,
+        ));
     } else {
-        lines.push(Line::from("Cell: no"));
+        lines.push(kv_line(
+            "Lattice",
+            "unavailable".to_string(),
+            Color::Cyan,
+            Color::DarkGray,
+        ));
     }
 
-    lines.extend([
-        Line::from(""),
-        Line::from(format!(
-            "Rot: p {:.2}, y {:.2}, r {:.2}",
-            app.rotation[0], app.rotation[1], app.roll
-        )),
-        Line::from(format!("Zoom: {:.2}", app.zoom)),
-        Line::from(format!("FOV: {:.1} deg", app.fov_deg)),
-        Line::from(format!("FOV size lock: {}", bool_label(app.lock_fov_zoom))),
-        Line::from(format!("Pan: x {:.2}, y {:.2}", app.pan[0], app.pan[1])),
-        Line::from(""),
-        Line::from(format!(
-            "Bonds [{}]  Cell [{}]  Cell top [{}]  Labels [{}]",
-            bool_label(app.show_bonds),
-            bool_label(app.show_cell),
-            bool_label(app.cell_on_top),
-            bool_label(app.show_labels)
-        )),
-        Line::from(format!(
-            "Boundary imgs [{}]: {}",
-            bool_label(app.show_boundary_images),
-            app.scene.boundary_image_count
-        )),
-        Line::from(format!(
-            "Bonded imgs [{}]: {}",
-            bool_label(app.show_bonded_images),
-            app.scene.bonded_image_count
-        )),
-        Line::from(format!("Bond max: {:.2} A", app.bond_max_distance)),
-        Line::from(format!("Sphere scale: {:.2}", app.sphere_scale)),
-        Line::from(format!(
-            "Orientation gizmo: {}",
-            bool_label(app.show_orientation_gizmo)
-        )),
-        Line::from(format!("Theme: {}", app.render_theme.label())),
-        Line::from(""),
-    ]);
+    lines.push(Line::default());
 
     if let Some(atom) = selected {
-        lines.push(Line::from(format!(
-            "Selected: {}/{}",
-            app.selected_atom + 1,
-            app.structure.atoms.len()
-        )));
-        lines.push(Line::from(format!("{} ({})", atom.label, atom.element)));
-        lines.push(Line::from(format!(
-            "x {:.3}  y {:.3}  z {:.3}",
-            atom.position[0], atom.position[1], atom.position[2]
-        )));
+        let atom_col = atom_color(&atom.element, false);
+        lines.push(kv_line(
+            "Index",
+            format!("{}/{}", app.selected_atom + 1, app.structure.atoms.len()),
+            Color::Cyan,
+            Color::LightYellow,
+        ));
+        lines.push(Line::from(vec![
+            Span::styled("Atom: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                atom.label.clone(),
+                Style::default().fg(atom_col).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled("  Element: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                atom.element.clone(),
+                Style::default().fg(atom_col).add_modifier(Modifier::BOLD),
+            ),
+        ]));
+        lines.push(Line::from(vec![
+            Span::styled("x ", Style::default().fg(Color::Red)),
+            Span::styled(
+                format!("{:.3}", atom.position[0]),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("  y ", Style::default().fg(Color::Green)),
+            Span::styled(
+                format!("{:.3}", atom.position[1]),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled("  z ", Style::default().fg(Color::Blue)),
+            Span::styled(
+                format!("{:.3}", atom.position[2]),
+                Style::default().fg(Color::White),
+            ),
+            Span::styled(" A", Style::default().fg(Color::Gray)),
+        ]));
         if let Some(frac) = atom.fractional {
-            lines.push(Line::from(format!(
-                "f {:.3}  {:.3}  {:.3}",
-                frac[0], frac[1], frac[2]
-            )));
+            lines.push(Line::from(vec![
+                Span::styled("Frac ", Style::default().fg(Color::LightMagenta)),
+                Span::styled("x ", Style::default().fg(Color::Red)),
+                Span::styled(format!("{:.3}", frac[0]), Style::default().fg(Color::White)),
+                Span::styled("  y ", Style::default().fg(Color::Green)),
+                Span::styled(format!("{:.3}", frac[1]), Style::default().fg(Color::White)),
+                Span::styled("  z ", Style::default().fg(Color::Blue)),
+                Span::styled(format!("{:.3}", frac[2]), Style::default().fg(Color::White)),
+            ]));
         }
     } else {
-        lines.push(Line::from("Selected: none"));
+        lines.push(Line::from(vec![
+            Span::styled("Selected: ", Style::default().fg(Color::Cyan)),
+            Span::styled("none", Style::default().fg(Color::DarkGray)),
+        ]));
     }
 
-    lines.push(Line::from(""));
-    lines.push(Line::from(format!("Status: {}", app.status)));
     lines
 }
 
-fn help_line() -> Line<'static> {
-    Line::from(
-        "h/j/k/l rotate  u/o roll  +/- zoom  ,/. fov  z lock fov size  w/a/s/d pan  i isometric  [/] sphere  v axes  g theme  b bonds  c cell  x cell top  r boundary imgs  t bonded imgs  n/m bond max  Shift+A/B/C axis view  Shift+L labels  Tab atom  q quit",
-    )
+fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
+    let boundary_color = match (app.show_boundary_images, app.scene.boundary_image_count > 0) {
+        (true, true) => Color::LightGreen,
+        (true, false) => Color::LightYellow,
+        (false, _) => Color::LightRed,
+    };
+    let bonded_color = match (app.show_bonded_images, app.scene.bonded_image_count > 0) {
+        (true, true) => Color::LightGreen,
+        (true, false) => Color::LightYellow,
+        (false, _) => Color::LightRed,
+    };
+
+    vec![
+        control_short_value_line(
+            "g",
+            "Theme",
+            app.render_theme.label().to_string(),
+            theme_color(app.render_theme),
+        ),
+        control_short_bool_line("v", "Gizmo", app.show_orientation_gizmo),
+        control_short_bool_line("b", "Bonds", app.show_bonds),
+        control_short_bool_line("c", "Cell", app.show_cell),
+        control_short_bool_line("x", "Cell top", app.cell_on_top),
+        control_short_bool_line("Shift+L", "Labels", app.show_labels),
+        control_short_value_line(
+            "r",
+            "Boundary imgs",
+            if app.show_boundary_images {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            },
+            boundary_color,
+        ),
+        control_short_value_line(
+            "t",
+            "Bonded imgs",
+            if app.show_bonded_images {
+                "on".to_string()
+            } else {
+                "off".to_string()
+            },
+            bonded_color,
+        ),
+        control_short_bool_line("z", "FOV lock", app.lock_fov_zoom),
+        control_short_value_line(
+            "+/ -",
+            "Zoom",
+            format!("{:.2}", app.zoom),
+            Color::LightYellow,
+        ),
+        control_short_value_line(
+            ",/.",
+            "FOV",
+            format!("{:.1} deg", app.fov_deg),
+            Color::LightYellow,
+        ),
+        control_short_value_line(
+            "w/a/s/d",
+            "Pan",
+            format!("x {:.2} y {:.2}", app.pan[0], app.pan[1]),
+            Color::White,
+        ),
+        control_short_value_line(
+            "h/j/k/l,u/o",
+            "Rot",
+            format!(
+                "p {:.2} y {:.2} r {:.2}",
+                app.rotation[0], app.rotation[1], app.roll
+            ),
+            Color::White,
+        ),
+        control_short_value_line(
+            "n/m/N/M",
+            "Bond max",
+            format!("{:.2} A", app.bond_max_distance),
+            Color::LightYellow,
+        ),
+        control_short_value_line(
+            "[/]",
+            "Sphere",
+            format!("{:.2}", app.sphere_scale),
+            Color::LightYellow,
+        ),
+        control_short_value_line(
+            "Tab",
+            "Atom",
+            format!("{}/{}", app.selected_atom + 1, app.structure.atoms.len()),
+            Color::LightGreen,
+        ),
+        control_short_value_line("q", "Quit", "exit".to_string(), Color::LightRed),
+    ]
 }
 
-fn bool_label(value: bool) -> &'static str {
-    if value { "on" } else { "off" }
+fn kv_line(label: &str, value: String, label_color: Color, value_color: Color) -> Line<'static> {
+    Line::from(vec![
+        Span::styled(format!("{label}: "), Style::default().fg(label_color)),
+        Span::styled(value, Style::default().fg(value_color)),
+    ])
+}
+
+fn elements_line(counts: &BTreeMap<String, usize>) -> Line<'static> {
+    let mut spans = vec![Span::styled(
+        format!("Elements ({}): ", counts.len()),
+        Style::default().fg(Color::Cyan),
+    )];
+    if counts.is_empty() {
+        spans.push(Span::styled("-", Style::default().fg(Color::DarkGray)));
+        return Line::from(spans);
+    }
+    for (idx, element) in counts.keys().enumerate() {
+        if idx > 0 {
+            spans.push(Span::styled(", ", Style::default().fg(Color::Gray)));
+        }
+        spans.push(Span::styled(
+            element.clone(),
+            Style::default()
+                .fg(atom_color(element, false))
+                .add_modifier(Modifier::BOLD),
+        ));
+    }
+    Line::from(spans)
+}
+
+fn control_short_prefix(key: &str, label: &str) -> Vec<Span<'static>> {
+    vec![
+        Span::styled(
+            format!("[{key}]"),
+            Style::default()
+                .fg(Color::LightYellow)
+                .bg(Color::DarkGray)
+                .add_modifier(Modifier::BOLD),
+        ),
+        Span::styled(" ", Style::default().fg(Color::Gray)),
+        Span::styled(format!("{label} "), Style::default().fg(Color::Cyan)),
+    ]
+}
+
+fn control_short_value_line(
+    key: &str,
+    label: &str,
+    value: String,
+    value_color: Color,
+) -> Line<'static> {
+    let mut spans = control_short_prefix(key, label);
+    spans.push(Span::styled(value, Style::default().fg(value_color)));
+    Line::from(spans)
+}
+
+fn control_short_bool_line(key: &str, label: &str, value: bool) -> Line<'static> {
+    let mut spans = control_short_prefix(key, label);
+    spans.push(bool_span(value));
+    Line::from(spans)
+}
+
+fn bool_span(value: bool) -> Span<'static> {
+    if value {
+        Span::styled(
+            "on",
+            Style::default()
+                .fg(Color::LightGreen)
+                .add_modifier(Modifier::BOLD),
+        )
+    } else {
+        Span::styled(
+            "off",
+            Style::default()
+                .fg(Color::LightRed)
+                .add_modifier(Modifier::BOLD),
+        )
+    }
+}
+
+fn theme_color(theme: RenderTheme) -> Color {
+    match theme {
+        RenderTheme::Dense => Color::White,
+        RenderTheme::Classic => Color::LightBlue,
+        RenderTheme::Orbital => Color::Cyan,
+        RenderTheme::Neon => Color::LightMagenta,
+    }
+}
+
+fn element_counts(atoms: &[crate::model::Atom]) -> BTreeMap<String, usize> {
+    let mut counts: BTreeMap<String, usize> = BTreeMap::new();
+    for atom in atoms {
+        *counts.entry(atom.element.clone()).or_insert(0) += 1;
+    }
+    counts
+}
+
+fn gcd_usize(mut a: usize, mut b: usize) -> usize {
+    while b != 0 {
+        let t = a % b;
+        a = b;
+        b = t;
+    }
+    a.max(1)
+}
+
+fn empirical_formula(counts: &BTreeMap<String, usize>) -> String {
+    if counts.is_empty() {
+        return "-".to_string();
+    }
+
+    let divisor = counts
+        .values()
+        .copied()
+        .reduce(gcd_usize)
+        .unwrap_or(1)
+        .max(1);
+    let mut order: Vec<String> = Vec::with_capacity(counts.len());
+    if counts.contains_key("C") {
+        order.push("C".to_string());
+        if counts.contains_key("H") {
+            order.push("H".to_string());
+        }
+        order.extend(
+            counts
+                .keys()
+                .filter(|k| k.as_str() != "C" && k.as_str() != "H")
+                .cloned(),
+        );
+    } else {
+        order.extend(counts.keys().cloned());
+    }
+
+    let mut out = String::new();
+    for element in order {
+        let n = counts.get(&element).copied().unwrap_or(0) / divisor;
+        if n == 0 {
+            continue;
+        }
+        out.push_str(&element);
+        if n > 1 {
+            out.push_str(&n.to_string());
+        }
+    }
+    if out.is_empty() { "-".to_string() } else { out }
+}
+
+fn cell_volume(cell: Cell) -> f32 {
+    let a = cell.lattice[0];
+    let b = cell.lattice[1];
+    let c = cell.lattice[2];
+    let cross_bc = [
+        b[1] * c[2] - b[2] * c[1],
+        b[2] * c[0] - b[0] * c[2],
+        b[0] * c[1] - b[1] * c[0],
+    ];
+    (a[0] * cross_bc[0] + a[1] * cross_bc[1] + a[2] * cross_bc[2]).abs()
 }
 
 #[cfg(test)]
@@ -1400,10 +1650,8 @@ struct SceneGeometry {
     bonds: Vec<BondSegment>,
     cell_edges: Vec<([f32; 3], [f32; 3])>,
     center: [f32; 3],
-    image_atom_count: usize,
     boundary_image_count: usize,
     bonded_image_count: usize,
-    periodic_enabled: bool,
 }
 
 fn build_scene(
@@ -1425,14 +1673,12 @@ fn build_scene(
 
     let mut bonds = Vec::new();
     let mut cell_edges = Vec::new();
-    let mut periodic_enabled = false;
     let mut boundary_image_keys: HashSet<(usize, i32, i32, i32)> = HashSet::new();
     let mut bonded_image_keys: HashSet<(usize, i32, i32, i32)> = HashSet::new();
 
     if let Some(cell) = structure.cell {
         cell_edges = cell.edge_segments();
         if structure.atoms.iter().all(|a| a.fractional.is_some()) {
-            periodic_enabled = true;
             if include_boundary_images {
                 add_boundary_repeat_images(structure, &mut boundary_image_keys);
             }
@@ -1468,7 +1714,6 @@ fn build_scene(
     } else {
         structure.center()
     };
-    let image_atom_count = render_atoms.iter().filter(|a| a.is_image).count();
     let boundary_image_count = boundary_image_keys.len();
     let bonded_image_count = bonded_image_keys.len();
 
@@ -1477,10 +1722,8 @@ fn build_scene(
         bonds,
         cell_edges,
         center,
-        image_atom_count,
         boundary_image_count,
         bonded_image_count,
-        periodic_enabled,
     }
 }
 
@@ -1786,11 +2029,11 @@ mod tests {
                 },
             ],
             cell: Some(cell),
+            space_group: None,
         };
 
         let scene = build_scene(&structure, true, true, DEFAULT_BOND_MAX_DISTANCE);
-        assert!(scene.periodic_enabled);
-        assert!(scene.image_atom_count > 0);
+        assert!(scene.boundary_image_count + scene.bonded_image_count > 0);
         assert!(!scene.bonds.is_empty());
     }
 
@@ -1814,6 +2057,7 @@ mod tests {
                 },
             ],
             cell: Some(cell),
+            space_group: None,
         };
 
         let strict = build_scene(&structure, false, true, 2.0);
@@ -1845,6 +2089,7 @@ mod tests {
                 },
             ],
             cell: Some(cell),
+            space_group: None,
         };
 
         let without_boundary = build_scene(&structure, false, true, 2.2);
@@ -1894,6 +2139,7 @@ mod tests {
                 },
             ],
             cell: Some(cell),
+            space_group: None,
         };
         let mut app = App::new(structure);
 
@@ -1909,7 +2155,10 @@ mod tests {
         assert!(!app.show_bonded_images);
         assert_eq!(app.scene.boundary_image_count, 0);
         assert_eq!(app.scene.bonded_image_count, 0);
-        assert_eq!(app.scene.image_atom_count, 0);
+        assert_eq!(
+            app.scene.boundary_image_count + app.scene.bonded_image_count,
+            0
+        );
 
         app.handle_key_press(KeyCode::Char('r'));
         assert!(app.show_boundary_images);
@@ -1923,6 +2172,7 @@ mod tests {
             title: "overlay test".to_string(),
             atoms: vec![],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
         assert!(!app.cell_on_top);
@@ -1940,14 +2190,9 @@ mod tests {
             title: "theme test".to_string(),
             atoms: vec![],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
-        assert_eq!(app.render_theme, RenderTheme::Dense);
-
-        app.handle_key_press(KeyCode::Char('g'));
-        assert_eq!(app.render_theme, RenderTheme::Classic);
-
-        app.handle_key_press(KeyCode::Char('g'));
         assert_eq!(app.render_theme, RenderTheme::Orbital);
 
         app.handle_key_press(KeyCode::Char('g'));
@@ -1955,6 +2200,12 @@ mod tests {
 
         app.handle_key_press(KeyCode::Char('g'));
         assert_eq!(app.render_theme, RenderTheme::Dense);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Classic);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Orbital);
     }
 
     #[test]
@@ -1963,6 +2214,7 @@ mod tests {
             title: "gizmo toggle test".to_string(),
             atoms: vec![],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
         assert!(app.show_orientation_gizmo);
@@ -1980,6 +2232,7 @@ mod tests {
             title: "labels toggle test".to_string(),
             atoms: vec![],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
         assert!(app.show_labels);
@@ -2002,6 +2255,7 @@ mod tests {
                 fractional: None,
             }],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
         app.show_bonds = false;
@@ -2053,6 +2307,7 @@ mod tests {
                 fractional: Some([0.5, 0.5, 0.5]),
             }],
             cell: Some(cell),
+            space_group: None,
         };
         let mut app = App::new(structure);
         let center = app.scene.center;
@@ -2083,6 +2338,7 @@ mod tests {
             title: "iso test".to_string(),
             atoms: vec![],
             cell: None,
+            space_group: None,
         };
         let mut app = App::new(structure);
         app.rotation = [0.0, 0.0];
@@ -2124,6 +2380,7 @@ mod tests {
                 },
             ],
             cell: Some(cell),
+            space_group: None,
         };
 
         let mut with_cell = App::new(structure.clone());
