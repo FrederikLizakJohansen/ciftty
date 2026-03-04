@@ -1,9 +1,10 @@
 # ciftty
 
-`ciftty` is a terminal CIF crystal structure viewer written in Rust.
+`ciftty` is a terminal CIF crystal structure viewer and editor written in Rust.
 
 Renders atomic structures as shaded ASCII spheres with bonds, periodic images,
-and a unit-cell wireframe — all inside your terminal.
+and a unit-cell wireframe. It can also simulate powder XRD patterns and edit/save
+structures directly in the TUI.
 
 ## Install
 
@@ -24,6 +25,7 @@ ciftty
 ```
 
 Press `Shift+O` at any time to open the CIF browser dialog.
+Press `Shift+E` to edit the current structure, or `Shift+F` to start a new one.
 
 ## Controls
 
@@ -59,6 +61,30 @@ Press `Shift+O` at any time to open the CIF browser dialog.
 | `v` | Toggle orientation gizmo |
 | `Shift+L` | Toggle atom labels |
 
+### Diffraction
+| Key | Action |
+|-----|--------|
+| `Shift+X` | Toggle XRD panel |
+| `Shift+W` | Cycle X-ray source (`Cu Kα` / `Mo Kα` / `Co Kα` / `Ag Kα`) |
+
+### Editor
+| Key | Action |
+|-----|--------|
+| `Shift+E` | Toggle editor for current structure |
+| `Shift+F` | Open editor with a new empty structure |
+
+### Editor (while editor is open)
+| Key | Action |
+|-----|--------|
+| `Enter` | Enter/leave field edit mode |
+| `Tab` / `Shift+Tab` | Next / previous field |
+| Arrow keys | Move focus (nav mode) or cursor/focus (edit mode) |
+| `A` | Add atom row |
+| `D` / `Delete` | Delete focused atom row |
+| `Ctrl+A` | Apply edits to the live structure |
+| `Ctrl+S` | Save CIF (existing path or `<title>.cif`) |
+| `Esc` | Exit edit mode (or close editor from nav mode) |
+
 ### Spin lock
 | Key | Action |
 |-----|--------|
@@ -83,6 +109,9 @@ Mouse drag rotates the view; scroll wheel zooms (`Ctrl+scroll` changes FOV).
 - Symmetry expansion from `_symmetry_equiv_pos_as_xyz` / `_space_group_symop` loops
 - Periodic boundary images and bonded outside-cell images
 - Orientation gizmo (RGB x/y/z axes)
+- Simulated powder XRD panel with wavelength presets and top-peak labels
+- Built-in structure editor for title, cell, space group, and asymmetric-unit atoms
+- Apply edits live and save back to CIF
 - Kitty keyboard protocol for smooth key-repeat
 
 ## License
