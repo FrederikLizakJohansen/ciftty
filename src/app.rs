@@ -583,23 +583,17 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     let element_counts = &app.cached_element_counts;
     let formula = app.cached_formula.clone();
 
+    // Crystal info block (no section header — title is the implicit heading)
     let mut lines = vec![
-        kv_line(
-            "Title",
+        Line::from(Span::styled(
             app.structure.title.clone(),
-            Color::Cyan,
-            Color::White,
-        ),
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
         kv_line("Formula", formula, Color::Cyan, Color::LightYellow),
-        elements_line(element_counts),
         kv_line(
-            "Atom sites",
-            total_atoms.to_string(),
-            Color::Cyan,
-            Color::LightGreen,
-        ),
-        kv_line(
-            "Space group",
+            "Group",
             app.structure
                 .space_group
                 .clone()
@@ -607,7 +601,9 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
             Color::Cyan,
             Color::LightBlue,
         ),
+        elements_line(element_counts),
         Line::default(),
+        section_header("LATTICE"),
     ];
 
     if let Some(cell) = app.structure.cell {
@@ -618,29 +614,29 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
             Span::styled(format!("{:.3}", cell.b), Style::default().fg(Color::White)),
             Span::styled("  c ", Style::default().fg(Color::Blue)),
             Span::styled(format!("{:.3}", cell.c), Style::default().fg(Color::White)),
-            Span::styled(" A", Style::default().fg(Color::Gray)),
+            Span::styled(" Å", Style::default().fg(Color::Gray)),
         ]));
         lines.push(Line::from(vec![
-            Span::styled("alpha ", Style::default().fg(Color::LightRed)),
+            Span::styled("α ", Style::default().fg(Color::LightRed)),
             Span::styled(
                 format!("{:.1}", cell.alpha_deg),
                 Style::default().fg(Color::LightYellow),
             ),
-            Span::styled("  beta ", Style::default().fg(Color::LightGreen)),
+            Span::styled("  β ", Style::default().fg(Color::LightGreen)),
             Span::styled(
                 format!("{:.1}", cell.beta_deg),
                 Style::default().fg(Color::LightYellow),
             ),
-            Span::styled("  gamma ", Style::default().fg(Color::LightBlue)),
+            Span::styled("  γ ", Style::default().fg(Color::LightBlue)),
             Span::styled(
                 format!("{:.1}", cell.gamma_deg),
                 Style::default().fg(Color::LightYellow),
             ),
-            Span::styled(" deg", Style::default().fg(Color::Gray)),
+            Span::styled("°", Style::default().fg(Color::Gray)),
         ]));
         lines.push(kv_line(
-            "Volume",
-            format!("{:.3} A^3", cell_volume(cell)),
+            "Vol",
+            format!("{:.1} Å³", cell_volume(cell)),
             Color::Cyan,
             Color::LightCyan,
         ));
@@ -654,25 +650,23 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     }
 
     lines.push(Line::default());
+    lines.push(section_header("ATOM"));
 
     if let Some(atom) = selected {
         let atom_col = atom_color(&atom.element, false);
-        lines.push(kv_line(
-            "Index",
-            format!("{}/{}", app.selected_atom + 1, app.structure.atoms.len()),
-            Color::Cyan,
-            Color::LightYellow,
-        ));
         lines.push(Line::from(vec![
-            Span::styled("Atom: ", Style::default().fg(Color::Cyan)),
+            Span::styled(
+                format!("{} / {}  ", app.selected_atom + 1, total_atoms),
+                Style::default().fg(Color::Gray),
+            ),
             Span::styled(
                 atom.label.clone(),
                 Style::default().fg(atom_col).add_modifier(Modifier::BOLD),
             ),
-            Span::styled("  Element: ", Style::default().fg(Color::Cyan)),
+            Span::styled("  ", Style::default()),
             Span::styled(
                 atom.element.clone(),
-                Style::default().fg(atom_col).add_modifier(Modifier::BOLD),
+                Style::default().fg(atom_col),
             ),
         ]));
         lines.push(Line::from(vec![
@@ -691,24 +685,23 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
                 format!("{:.3}", atom.position[2]),
                 Style::default().fg(Color::White),
             ),
-            Span::styled(" A", Style::default().fg(Color::Gray)),
+            Span::styled(" Å", Style::default().fg(Color::Gray)),
         ]));
         if let Some(frac) = atom.fractional {
             lines.push(Line::from(vec![
-                Span::styled("Frac ", Style::default().fg(Color::LightMagenta)),
-                Span::styled("x ", Style::default().fg(Color::Red)),
+                Span::styled("frac ", Style::default().fg(Color::DarkGray)),
                 Span::styled(format!("{:.3}", frac[0]), Style::default().fg(Color::White)),
-                Span::styled("  y ", Style::default().fg(Color::Green)),
+                Span::styled("  ", Style::default()),
                 Span::styled(format!("{:.3}", frac[1]), Style::default().fg(Color::White)),
-                Span::styled("  z ", Style::default().fg(Color::Blue)),
+                Span::styled("  ", Style::default()),
                 Span::styled(format!("{:.3}", frac[2]), Style::default().fg(Color::White)),
             ]));
         }
     } else {
-        lines.push(Line::from(vec![
-            Span::styled("Selected: ", Style::default().fg(Color::Cyan)),
-            Span::styled("none", Style::default().fg(Color::DarkGray)),
-        ]));
+        lines.push(Line::from(Span::styled(
+            "none",
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     lines
@@ -727,20 +720,22 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
     };
 
     vec![
+        section_header("VIEW"),
         control_short_value_line(
             "g",
             "Theme",
             app.render_theme.label().to_string(),
             theme_color(app.render_theme),
         ),
-        control_short_bool_line("v", "Gizmo", app.show_orientation_gizmo),
         control_short_bool_line("b", "Bonds", app.show_bonds),
         control_short_bool_line("c", "Cell", app.show_cell),
-        control_short_bool_line("x", "Cell top", app.cell_on_top),
-        control_short_bool_line("Shift+L", "Labels", app.show_labels),
+        control_short_bool_line("x", "Cell overlay", app.cell_on_top),
+        control_short_bool_line("v", "Gizmo", app.show_orientation_gizmo),
+        control_short_bool_line("L", "Labels", app.show_labels),
+        section_header("IMAGES"),
         control_short_value_line(
             "r",
-            "Boundary imgs",
+            "Periodic",
             if app.show_boundary_images {
                 "on".to_string()
             } else {
@@ -750,7 +745,7 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
         ),
         control_short_value_line(
             "t",
-            "Bonded imgs",
+            "Bonded",
             if app.show_bonded_images {
                 "on".to_string()
             } else {
@@ -758,45 +753,46 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
             },
             bonded_color,
         ),
-        control_short_bool_line("z", "FOV lock", app.lock_fov_zoom),
+        section_header("CAMERA"),
         control_short_value_line(
-            "+/-, wheel",
+            "+/-",
             "Zoom",
             format!("{:.2}", app.zoom),
             Color::LightYellow,
         ),
         control_short_value_line(
-            ",/., Ctrl+wheel",
+            ",/.",
             "FOV",
-            format!("{:.1} deg", app.fov_deg),
+            format!("{:.1}°", app.fov_deg),
             Color::LightYellow,
         ),
+        control_short_bool_line("z", "Size lock", app.lock_fov_zoom),
         control_short_value_line(
-            "w/a/s/d",
+            "wasd",
             "Pan",
-            format!("x {:.2} y {:.2}", app.pan[0], app.pan[1]),
+            format!("{:.2}  {:.2}", app.pan[0], app.pan[1]),
             Color::White,
         ),
         control_short_value_line(
-            "h/j/k/l,u/o",
-            "Rot",
+            "hjkl/uo",
+            "Look",
             {
-                // Show the camera's look direction (row 2 of the rotation matrix).
                 let d = app.rot_mat[2];
-                format!("d {:.2} {:.2} {:.2}", d[0], d[1], d[2])
+                format!("{:.2}  {:.2}  {:.2}", d[0], d[1], d[2])
             },
             Color::White,
         ),
-        control_short_value_line(
-            "n/m/N/M",
-            "Bond max",
-            format!("{:.2} A", app.bond_max_distance),
-            Color::LightYellow,
-        ),
+        section_header("RENDER"),
         control_short_value_line(
             "[/]",
             "Sphere",
             format!("{:.2}", app.sphere_scale),
+            Color::LightYellow,
+        ),
+        control_short_value_line(
+            "nm",
+            "Bond Å",
+            format!("{:.2}", app.bond_max_distance),
             Color::LightYellow,
         ),
         control_short_value_line(
@@ -805,8 +801,16 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
             format!("{}/{}", app.selected_atom + 1, app.structure.atoms.len()),
             Color::LightGreen,
         ),
-        control_short_value_line("q", "Quit", "exit".to_string(), Color::LightRed),
     ]
+}
+
+fn section_header(label: &str) -> Line<'static> {
+    Line::from(Span::styled(
+        format!("  {label}"),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
+    ))
 }
 
 fn kv_line(label: &str, value: String, label_color: Color, value_color: Color) -> Line<'static> {
@@ -1869,7 +1873,14 @@ fn add_bonds_and_periodic_images(
                             atom_j.position[1] + target_cart_shift[1],
                             atom_j.position[2] + target_cart_shift[2],
                         ];
-                        bonds.push(BondSegment { start, end });
+
+                        let target_in_cell = target_shift == [0, 0, 0];
+                        let target_is_boundary = boundary_image_keys.contains(&target_key);
+                        let target_rendered =
+                            target_in_cell || target_is_boundary || include_bonded_images;
+                        if target_rendered {
+                            bonds.push(BondSegment { start, end });
+                        }
 
                         if include_bonded_images && target_shift != [0, 0, 0] {
                             image_keys.insert(target_key);
@@ -2030,7 +2041,7 @@ mod tests {
 
     #[test]
     fn fov_size_lock_keeps_extent_for_fov_changes_only() {
-        let cif = include_str!("../Fe.cif");
+        let cif = include_str!("../data/Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
         let mut app = App::new(structure);
         assert!(app.lock_fov_zoom);
@@ -2139,7 +2150,7 @@ mod tests {
 
     #[test]
     fn extreme_perspective_settings_do_not_panic() {
-        let cif = include_str!("../Fe.cif");
+        let cif = include_str!("../data/Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
         let mut app = App::new(structure);
         app.fov_deg = MIN_FOV_DEG;
@@ -2208,6 +2219,48 @@ mod tests {
         let relaxed = build_scene(&structure, false, true, 2.2);
         assert!(!relaxed.bonds.is_empty());
         assert!(relaxed.bonded_image_count > 0);
+    }
+
+    #[test]
+    fn bonds_to_hidden_image_atoms_are_excluded() {
+        // Two atoms whose only bond crosses the periodic boundary (distance ~1 Å
+        // in a 10 Å cell, well within DEFAULT_BOND_MAX_DISTANCE).
+        let cell = Cell::from_parameters(10.0, 10.0, 10.0, 90.0, 90.0, 90.0).expect("valid cell");
+        let structure = Structure {
+            title: "dangling bond test".to_string(),
+            atoms: vec![
+                Atom {
+                    label: "A".to_string(),
+                    element: "C".to_string(),
+                    position: cell.frac_to_cart([0.95, 0.5, 0.5]),
+                    fractional: Some([0.95, 0.5, 0.5]),
+                },
+                Atom {
+                    label: "B".to_string(),
+                    element: "C".to_string(),
+                    position: cell.frac_to_cart([0.05, 0.5, 0.5]),
+                    fractional: Some([0.05, 0.5, 0.5]),
+                },
+            ],
+            cell: Some(cell),
+            space_group: None,
+        };
+
+        // With both image types off, the cross-boundary bond target is a
+        // non-rendered atom — no bond should appear.
+        let no_images = build_scene(&structure, false, false, DEFAULT_BOND_MAX_DISTANCE);
+        assert_eq!(
+            no_images.bonds.len(),
+            0,
+            "dangling bond to hidden image atom must not be generated"
+        );
+
+        // With bonded images on, the bond to the image atom is rendered → bond appears.
+        let with_bonded = build_scene(&structure, false, true, DEFAULT_BOND_MAX_DISTANCE);
+        assert!(
+            !with_bonded.bonds.is_empty(),
+            "cross-boundary bond should appear when bonded images are enabled"
+        );
     }
 
     #[test]
@@ -2565,7 +2618,7 @@ mod tests {
 
     #[test]
     fn toggling_cell_for_fe_fixture_only_replaces_pixels_with_cell_glyph() {
-        let cif = include_str!("../Fe.cif");
+        let cif = include_str!("../data/Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
 
         let mut with_cell = App::new(structure.clone());
@@ -2599,7 +2652,7 @@ mod tests {
 
     #[test]
     fn toggling_cell_with_bonds_for_fe_fixture_only_replaces_pixels_with_cell_glyph() {
-        let cif = include_str!("../Fe.cif");
+        let cif = include_str!("../data/Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
 
         let mut with_cell = App::new(structure.clone());
@@ -2729,7 +2782,7 @@ mod tests {
     fn cached_formula_and_counts_match_direct_computation() {
         // Ensure the cached values in App exactly equal what the free functions produce.
         use super::{element_counts, empirical_formula};
-        let cif = include_str!("../U3Te4.cif");
+        let cif = include_str!("../data/U3Te4.cif");
         let structure = parse_cif_str(cif, "u3te4").expect("should parse");
         let app = App::new(structure.clone());
 

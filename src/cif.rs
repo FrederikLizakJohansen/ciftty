@@ -593,21 +593,21 @@ loop_
 
     #[test]
     fn expands_symmetry_to_match_fe_multiplicity() {
-        let cif = include_str!("../Fe.cif");
+        let cif = include_str!("../data/Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
         assert_eq!(structure.atoms.len(), 2);
     }
 
     #[test]
     fn expands_symmetry_to_match_u3te4_multiplicity() {
-        let cif = include_str!("../U3Te4.cif");
+        let cif = include_str!("../data/U3Te4.cif");
         let structure = parse_cif_str(cif, "u3te4_fixture").expect("U3Te4.cif should parse");
         assert_eq!(structure.atoms.len(), 28);
     }
 
     #[test]
     fn expands_symmetry_to_match_cega2_multiplicity() {
-        let cif = include_str!("../CeGa2.cif");
+        let cif = include_str!("../data/CeGa2.cif");
         let structure = parse_cif_str(cif, "cega2_fixture").expect("CeGa2.cif should parse");
         assert_eq!(structure.atoms.len(), 3);
     }
