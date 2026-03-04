@@ -2,6 +2,13 @@
 name = "ciftty"
 version = "0.1.0"
 edition = "2024"
+description = "Terminal CIF crystal structure viewer"
+license = "MIT"
+repository = "https://github.com/FrederikLizakJohansen/ciftty"
+homepage = "https://github.com/FrederikLizakJohansen/ciftty"
+keywords = ["cif", "crystal", "tui", "chemistry", "crystallography"]
+categories = ["visualization", "science", "command-line-utilities"]
+readme = "README.md"
 
 [dependencies]
 anyhow = "1.0"

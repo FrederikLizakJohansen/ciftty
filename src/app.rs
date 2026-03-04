@@ -45,7 +45,7 @@ const DEFAULT_BOND_MAX_DISTANCE: f32 = 2.2;
 const MIN_BOND_MAX_DISTANCE: f32 = 0.0;
 const MAX_BOND_MAX_DISTANCE: f32 = 12.0;
 const BOND_MAX_DISTANCE_STEP: f32 = 0.10;
-// Classic ASCII shading ramp from dark to bright (spec §6).
+// Classic ASCII shading ramp from dark to bright.
 const SHADE_RAMP_CLASSIC: &[char] = &[' ', '.', ':', '-', '=', '+', '*', '#', '%', '@'];
 // Dense shading ramp from dark to bright; this fills terminal rows better.
 const SHADE_RAMP_DENSE: &[char] = &[' ', '░', '▒', '▓', '█'];
@@ -53,6 +53,8 @@ const SHADE_RAMP_DENSE: &[char] = &[' ', '░', '▒', '▓', '█'];
 const SHADE_RAMP_ORBITAL: &[char] = &[' ', '·', '∘', '○', '◍', '●'];
 // Neon theme: high-contrast punctuated ramp.
 const SHADE_RAMP_NEON: &[char] = &[' ', '.', ':', '*', 'o', 'O', '@'];
+// Wild theme: high-energy spark ramp.
+const SHADE_RAMP_WILD: &[char] = &[' ', '·', ':', '*', '✶', '✸', '✹'];
 // Lambert light direction (normalized below in sphere_glyph).
 const LIGHT: [f32; 3] = [0.268, 0.358, 0.894]; // normalize([0.3, 0.4, 1.0])
 const CELL_LINE_COLOR: Color = Color::White;
@@ -77,6 +79,7 @@ enum RenderTheme {
     Classic,
     Orbital,
     Neon,
+    Wild,
 }
 
 impl RenderTheme {
@@ -85,7 +88,8 @@ impl RenderTheme {
             Self::Dense => Self::Classic,
             Self::Classic => Self::Orbital,
             Self::Orbital => Self::Neon,
-            Self::Neon => Self::Dense,
+            Self::Neon => Self::Wild,
+            Self::Wild => Self::Dense,
         }
     }
 
@@ -95,6 +99,7 @@ impl RenderTheme {
             Self::Classic => "classic",
             Self::Orbital => "orbital",
             Self::Neon => "neon",
+            Self::Wild => "wild",
         }
     }
 
@@ -104,6 +109,7 @@ impl RenderTheme {
             Self::Classic => SHADE_RAMP_CLASSIC,
             Self::Orbital => SHADE_RAMP_ORBITAL,
             Self::Neon => SHADE_RAMP_NEON,
+            Self::Wild => SHADE_RAMP_WILD,
         }
     }
 
@@ -113,6 +119,7 @@ impl RenderTheme {
             Self::Classic => ':',
             Self::Orbital => '·',
             Self::Neon => '=',
+            Self::Wild => '✦',
         }
     }
 
@@ -122,6 +129,7 @@ impl RenderTheme {
             Self::Classic => '-',
             Self::Orbital => '•',
             Self::Neon => '~',
+            Self::Wild => '*',
         }
     }
 
@@ -129,6 +137,7 @@ impl RenderTheme {
         match self {
             Self::Orbital => Color::Cyan,
             Self::Neon => Color::LightCyan,
+            Self::Wild => Color::LightMagenta,
             _ => CELL_LINE_COLOR,
         }
     }
@@ -137,6 +146,7 @@ impl RenderTheme {
         match self {
             Self::Orbital => Color::LightMagenta,
             Self::Neon => Color::LightYellow,
+            Self::Wild => Color::LightRed,
             _ => BOND_LINE_COLOR,
         }
     }
@@ -1096,7 +1106,6 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     let element_counts = &app.cached_element_counts;
     let formula = app.cached_formula.clone();
 
-    // Crystal info block (no section header — title is the implicit heading)
     let mut lines = vec![
         Line::from(Span::styled(
             app.structure.title.clone(),
@@ -1364,7 +1373,7 @@ fn elements_line(counts: &BTreeMap<String, usize>) -> Line<'static> {
 fn control_short_prefix(key: &str, label: &str) -> Vec<Span<'static>> {
     vec![
         Span::styled(
-            format!("[{key}]"),
+            format!("{key}"),
             Style::default()
                 .fg(Color::LightYellow)
                 .bg(Color::DarkGray)
@@ -1416,6 +1425,7 @@ fn theme_color(theme: RenderTheme) -> Color {
         RenderTheme::Classic => Color::LightBlue,
         RenderTheme::Orbital => Color::Cyan,
         RenderTheme::Neon => Color::LightMagenta,
+        RenderTheme::Wild => Color::LightRed,
     }
 }
 
@@ -1541,9 +1551,7 @@ impl ViewportTransform {
 /// Precomputed camera state for a single frame.
 ///
 /// Building this once per frame avoids recomputing trig values (sin/cos, tan)
-/// for every projected point. The rotation matrix combines Rx(pitch), Ry(yaw),
-/// and Rz(roll) into a single 3×3 matrix so each point transform is 9 muls +
-/// 6 adds instead of 3 × sin_cos + 12 muls.
+/// for every projected point.
 #[derive(Clone, Copy)]
 struct CameraParams {
     center: [f32; 3],
@@ -2920,6 +2928,9 @@ mod tests {
 
         app.handle_key_press(KeyCode::Char('g'));
         assert_eq!(app.render_theme, RenderTheme::Neon);
+
+        app.handle_key_press(KeyCode::Char('g'));
+        assert_eq!(app.render_theme, RenderTheme::Wild);
 
         app.handle_key_press(KeyCode::Char('g'));
         assert_eq!(app.render_theme, RenderTheme::Dense);
