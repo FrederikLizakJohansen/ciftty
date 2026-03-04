@@ -8,9 +8,16 @@
 cargo run -- path/to/structure.cif
 ```
 
+```bash
+cargo run
+```
+
 ## Core Controls
 
 - `h/j/k/l` rotate, `u/o` roll, `w/a/s/d` pan
+- `Shift+O` open CIF browser dialog (`Enter` open, `Backspace` parent, `Esc` close)
+- `Shift+R` spin-lock mode (directional input sets continuous spin)
+- `<` / `>` adjust spin speed
 - `+/-` or mouse wheel zoom, `,/.` or `Ctrl+wheel` FOV, `z` FOV-size lock
 - `b` bonds, `c` cell, `x` cell-on-top overlay
 - `r` boundary-repeat atoms, `t` bonded outside-cell atoms

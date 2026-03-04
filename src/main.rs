@@ -20,29 +20,32 @@ use ratatui::backend::CrosstermBackend;
 
 fn main() -> Result<()> {
     let path = parse_args()?;
-    let structure = cif::parse_cif_file(&path)?;
+    let structure = if let Some(path) = path {
+        Some(cif::parse_cif_file(&path)?)
+    } else {
+        None
+    };
+    let open_dialog_dir = env::current_dir().context("Could not determine current directory")?;
 
     let session = TerminalSession::enter().context("Failed to initialize terminal UI")?;
     let mut terminal = Terminal::new(CrosstermBackend::new(stdout()))
         .context("Failed to create terminal backend")?;
 
-    let run_result = app::run(&mut terminal, structure);
+    let run_result = app::run(&mut terminal, structure, open_dialog_dir);
     let _ = terminal.show_cursor();
     drop(session);
     run_result
 }
 
-fn parse_args() -> Result<PathBuf> {
+fn parse_args() -> Result<Option<PathBuf>> {
     let mut args = env::args().skip(1);
-    let Some(path) = args.next() else {
-        anyhow::bail!("Usage: ciftty <path/to/structure.cif>");
-    };
+    let path = args.next();
 
     if args.next().is_some() {
-        anyhow::bail!("Usage: ciftty <path/to/structure.cif>");
+        anyhow::bail!("Usage: ciftty [path/to/structure.cif]");
     }
 
-    Ok(PathBuf::from(path))
+    Ok(path.map(PathBuf::from))
 }
 
 struct TerminalSession;

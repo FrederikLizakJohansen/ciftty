@@ -1,6 +1,9 @@
 use std::cmp::Ordering;
 use std::collections::{BTreeMap, HashSet};
+use std::env;
+use std::fs;
 use std::io::Stdout;
+use std::path::{Path, PathBuf};
 use std::time::Duration;
 
 use anyhow::Result;
@@ -10,15 +13,15 @@ use crossterm::event::{
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
-use ratatui::layout::{Constraint, Direction, Layout};
+use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
-use ratatui::widgets::{Block, Borders, Paragraph, Wrap};
+use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::model::{Cell, Structure};
 
-const ROTATION_STEP: f32 = 0.1;
-const ROLL_STEP: f32 = 0.1;
+const ROTATION_STEP: f32 = 0.06;
+const ROLL_STEP: f32 = 0.06;
 const PAN_STEP: f32 = 0.08;
 const MIN_ZOOM: f32 = 0.05;
 const MIN_FOV_DEG: f32 = 10.0;
@@ -61,6 +64,12 @@ const AXIS_Z_COLOR: Color = Color::Blue;
 const ORIENTATION_GIZMO_RADIUS_COLS: f32 = 5.0;
 const ORIENTATION_GIZMO_MARGIN_COLS: f32 = 2.0;
 const ORIENTATION_GIZMO_MARGIN_ROWS: f32 = 2.0;
+const EMPTY_VIEW_HINT: &str = "Press Shift+O to open a CIF";
+const DEFAULT_SPIN_SPEED: f32 = 1.0;
+const MIN_SPIN_SPEED: f32 = 0.10;
+const MAX_SPIN_SPEED: f32 = 5.00;
+const SPIN_SPEED_STEP: f32 = 0.10;
+const SPIN_BASE_RATE_RAD_PER_SEC: f32 = 1.2;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenderTheme {
@@ -133,6 +142,159 @@ impl RenderTheme {
     }
 }
 
+#[derive(Debug, Clone)]
+struct FilePickerEntry {
+    path: PathBuf,
+    name: String,
+    is_dir: bool,
+}
+
+#[derive(Debug, Clone)]
+struct FilePickerState {
+    cwd: PathBuf,
+    entries: Vec<FilePickerEntry>,
+    selected: usize,
+    error: Option<String>,
+}
+
+impl FilePickerState {
+    fn new(cwd: PathBuf) -> Self {
+        let mut state = Self {
+            cwd,
+            entries: Vec::new(),
+            selected: 0,
+            error: None,
+        };
+        state.refresh();
+        state
+    }
+
+    fn refresh(&mut self) {
+        let previously_selected = self
+            .entries
+            .get(self.selected)
+            .map(|entry| entry.path.clone());
+
+        let mut directories = Vec::new();
+        let mut cif_files = Vec::new();
+
+        match fs::read_dir(&self.cwd) {
+            Ok(read_dir) => {
+                self.error = None;
+                for entry_result in read_dir {
+                    let Ok(entry) = entry_result else {
+                        continue;
+                    };
+                    let path = entry.path();
+                    let Ok(file_type) = entry.file_type() else {
+                        continue;
+                    };
+                    let name = entry.file_name().to_string_lossy().into_owned();
+                    if file_type.is_dir() {
+                        directories.push(FilePickerEntry {
+                            path,
+                            name,
+                            is_dir: true,
+                        });
+                    } else if file_type.is_file() && is_cif_path(&path) {
+                        cif_files.push(FilePickerEntry {
+                            path,
+                            name,
+                            is_dir: false,
+                        });
+                    }
+                }
+            }
+            Err(err) => {
+                self.entries.clear();
+                self.selected = 0;
+                self.error = Some(format!("Could not read directory: {err}"));
+                return;
+            }
+        }
+
+        let sort_key = |entry: &FilePickerEntry| entry.name.to_ascii_lowercase();
+        directories.sort_by_key(sort_key);
+        cif_files.sort_by_key(sort_key);
+
+        let mut entries = Vec::new();
+        if let Some(parent) = self.cwd.parent() {
+            entries.push(FilePickerEntry {
+                path: parent.to_path_buf(),
+                name: "..".to_string(),
+                is_dir: true,
+            });
+        }
+        entries.extend(directories);
+        entries.extend(cif_files);
+
+        self.entries = entries;
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        if let Some(selected_path) = previously_selected {
+            if let Some(index) = self
+                .entries
+                .iter()
+                .position(|entry| entry.path == selected_path)
+            {
+                self.selected = index;
+                return;
+            }
+        }
+        self.selected = self.selected.min(self.entries.len().saturating_sub(1));
+    }
+
+    fn move_selection(&mut self, delta: isize) {
+        if self.entries.is_empty() {
+            self.selected = 0;
+            return;
+        }
+        let max_index = self.entries.len().saturating_sub(1) as isize;
+        let next = (self.selected as isize + delta).clamp(0, max_index);
+        self.selected = next as usize;
+    }
+
+    fn open_selected(&mut self) -> Option<PathBuf> {
+        let entry = self.entries.get(self.selected)?.clone();
+        if entry.is_dir {
+            self.cwd = entry.path;
+            self.refresh();
+            None
+        } else {
+            Some(entry.path)
+        }
+    }
+
+    fn go_parent(&mut self) {
+        if let Some(parent) = self.cwd.parent() {
+            self.cwd = parent.to_path_buf();
+            self.refresh();
+        }
+    }
+}
+
+fn is_cif_path(path: &Path) -> bool {
+    path.extension()
+        .and_then(|ext| ext.to_str())
+        .map(|ext| ext.eq_ignore_ascii_case("cif"))
+        .unwrap_or(false)
+}
+
+fn default_open_dialog_dir() -> PathBuf {
+    env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
+}
+
+fn empty_structure() -> Structure {
+    Structure {
+        title: "No structure loaded".to_string(),
+        atoms: Vec::new(),
+        cell: None,
+        space_group: None,
+    }
+}
+
 pub struct App {
     structure: Structure,
     scene: SceneGeometry,
@@ -157,16 +319,29 @@ pub struct App {
     render_theme: RenderTheme,
     selected_atom: usize,
     should_quit: bool,
+    spin_lock: bool,
+    spin_speed: f32,
+    spin_velocity: [f32; 3], // [pitch, yaw, roll] direction; normalized when non-zero
     /// Column/row of the last mouse-drag position, for delta calculation.
     drag_last: Option<(u16, u16)>,
     /// Cached element → count map, derived from structure.atoms (immutable).
     cached_element_counts: BTreeMap<String, usize>,
     /// Cached Hill-order empirical formula derived from cached_element_counts.
     cached_formula: String,
+    open_dialog_dir: PathBuf,
+    file_picker: Option<FilePickerState>,
 }
 
 impl App {
     fn new(structure: Structure) -> Self {
+        Self::with_initial_structure(Some(structure), default_open_dialog_dir())
+    }
+
+    fn with_initial_structure(
+        initial_structure: Option<Structure>,
+        open_dialog_dir: PathBuf,
+    ) -> Self {
+        let structure = initial_structure.unwrap_or_else(empty_structure);
         let show_boundary_images = true;
         let show_bonded_images = true;
         let bond_max_distance = DEFAULT_BOND_MAX_DISTANCE;
@@ -202,13 +377,24 @@ impl App {
             render_theme: RenderTheme::Orbital,
             selected_atom: 0,
             should_quit: false,
+            spin_lock: false,
+            spin_speed: DEFAULT_SPIN_SPEED,
+            spin_velocity: [0.0, 0.0, 0.0],
             drag_last: None,
             cached_element_counts,
             cached_formula,
+            open_dialog_dir,
+            file_picker: None,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.file_picker.is_some() {
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                self.handle_file_picker_key(key.code);
+            }
+            return;
+        }
         match key.kind {
             KeyEventKind::Press => self.handle_key_press(key.code),
             KeyEventKind::Repeat => self.handle_key_repeat(key.code),
@@ -218,8 +404,15 @@ impl App {
 
     /// Actions that fire once per key-down (toggles, discrete steps).
     fn handle_key_press(&mut self, code: KeyCode) {
+        if self.spin_lock && self.set_spin_direction_from_key(code) {
+            return;
+        }
         match code {
             KeyCode::Char('q') => self.should_quit = true,
+            KeyCode::Char('O') => self.open_file_picker(),
+            KeyCode::Char('R') => self.toggle_spin_lock(),
+            KeyCode::Char('<') => self.adjust_spin_speed(-SPIN_SPEED_STEP),
+            KeyCode::Char('>') => self.adjust_spin_speed(SPIN_SPEED_STEP),
             KeyCode::Char('+') | KeyCode::Char('=') => self.set_zoom(self.zoom * 1.1),
             KeyCode::Char('-') => self.set_zoom(self.zoom / 1.1),
             KeyCode::Char(',') => self.set_fov(self.fov_deg - 2.0),
@@ -252,7 +445,56 @@ impl App {
         }
     }
 
+    fn open_file_picker(&mut self) {
+        self.file_picker = Some(FilePickerState::new(self.open_dialog_dir.clone()));
+    }
+
+    fn handle_file_picker_key(&mut self, code: KeyCode) {
+        let mut open_path: Option<PathBuf> = None;
+        let mut close_picker = false;
+        if let Some(picker) = self.file_picker.as_mut() {
+            match code {
+                KeyCode::Esc => close_picker = true,
+                KeyCode::Up | KeyCode::Char('k') => picker.move_selection(-1),
+                KeyCode::Down | KeyCode::Char('j') => picker.move_selection(1),
+                KeyCode::PageUp => picker.move_selection(-10),
+                KeyCode::PageDown => picker.move_selection(10),
+                KeyCode::Backspace | KeyCode::Left => picker.go_parent(),
+                KeyCode::Right | KeyCode::Enter => {
+                    open_path = picker.open_selected();
+                }
+                _ => {}
+            }
+        }
+        if close_picker {
+            self.file_picker = None;
+            return;
+        }
+
+        let Some(path) = open_path else {
+            return;
+        };
+
+        match crate::cif::parse_cif_file(&path) {
+            Ok(structure) => {
+                self.apply_structure(structure);
+                if let Some(parent) = path.parent() {
+                    self.open_dialog_dir = parent.to_path_buf();
+                }
+                self.file_picker = None;
+            }
+            Err(err) => {
+                if let Some(picker) = self.file_picker.as_mut() {
+                    picker.error = Some(format!("Could not load {}: {err}", path.display()));
+                }
+            }
+        }
+    }
+
     fn handle_key_repeat(&mut self, code: KeyCode) {
+        if self.spin_lock && self.set_spin_direction_from_key(code) {
+            return;
+        }
         self.apply_continuous_key(code);
     }
 
@@ -273,12 +515,8 @@ impl App {
             KeyCode::Char('k') => {
                 self.rot_mat = mat_mul_3x3(mat_rot_x(-ROTATION_STEP), self.rot_mat)
             }
-            KeyCode::Char('u') => {
-                self.rot_mat = mat_mul_3x3(mat_rot_z(-ROLL_STEP), self.rot_mat)
-            }
-            KeyCode::Char('o') => {
-                self.rot_mat = mat_mul_3x3(mat_rot_z(ROLL_STEP), self.rot_mat)
-            }
+            KeyCode::Char('u') => self.rot_mat = mat_mul_3x3(mat_rot_z(-ROLL_STEP), self.rot_mat),
+            KeyCode::Char('o') => self.rot_mat = mat_mul_3x3(mat_rot_z(ROLL_STEP), self.rot_mat),
             KeyCode::Char('w') => self.pan[1] += PAN_STEP,
             KeyCode::Char('s') => self.pan[1] -= PAN_STEP,
             KeyCode::Char('a') => self.pan[0] -= PAN_STEP,
@@ -334,6 +572,68 @@ impl App {
         self.show_orientation_gizmo = !self.show_orientation_gizmo;
     }
 
+    fn toggle_spin_lock(&mut self) {
+        self.spin_lock = !self.spin_lock;
+        if !self.spin_lock {
+            self.spin_velocity = [0.0, 0.0, 0.0];
+        }
+    }
+
+    fn adjust_spin_speed(&mut self, delta: f32) {
+        self.spin_speed = (self.spin_speed + delta).clamp(MIN_SPIN_SPEED, MAX_SPIN_SPEED);
+    }
+
+    fn set_spin_direction_from_key(&mut self, code: KeyCode) -> bool {
+        let direction = match code {
+            KeyCode::Char('h') => Some([0.0, -1.0, 0.0]),
+            KeyCode::Char('l') => Some([0.0, 1.0, 0.0]),
+            KeyCode::Char('j') => Some([1.0, 0.0, 0.0]),
+            KeyCode::Char('k') => Some([-1.0, 0.0, 0.0]),
+            KeyCode::Char('u') => Some([0.0, 0.0, -1.0]),
+            KeyCode::Char('o') => Some([0.0, 0.0, 1.0]),
+            _ => None,
+        };
+        let Some(direction) = direction else {
+            return false;
+        };
+        self.set_spin_direction(direction);
+        true
+    }
+
+    fn set_spin_direction(&mut self, direction: [f32; 3]) {
+        let norm = (direction[0] * direction[0]
+            + direction[1] * direction[1]
+            + direction[2] * direction[2])
+            .sqrt();
+        if norm <= f32::EPSILON {
+            return;
+        }
+        self.spin_velocity = [
+            direction[0] / norm,
+            direction[1] / norm,
+            direction[2] / norm,
+        ];
+    }
+
+    fn update_spin_motion(&mut self, delta_seconds: f32) {
+        if !self.spin_lock {
+            return;
+        }
+        let vx = self.spin_velocity[0];
+        let vy = self.spin_velocity[1];
+        let vz = self.spin_velocity[2];
+        if vx.abs() <= f32::EPSILON && vy.abs() <= f32::EPSILON && vz.abs() <= f32::EPSILON {
+            return;
+        }
+        let step = SPIN_BASE_RATE_RAD_PER_SEC * self.spin_speed * delta_seconds.max(0.0);
+        if step <= 0.0 {
+            return;
+        }
+        self.rot_mat = mat_mul_3x3(mat_rot_x(vx * step), self.rot_mat);
+        self.rot_mat = mat_mul_3x3(mat_rot_y(vy * step), self.rot_mat);
+        self.rot_mat = mat_mul_3x3(mat_rot_z(vz * step), self.rot_mat);
+    }
+
     fn adjust_bond_max_distance(&mut self, delta: f32) {
         let previous = self.bond_max_distance;
         self.bond_max_distance =
@@ -358,9 +658,8 @@ impl App {
         let scale = self.base_scale * zoom.max(MIN_ZOOM);
         // Precompute rotation matrix and focal once — this function is called
         // repeatedly inside the binary search in solve_zoom_for_extent.
-        let camera = CameraParams::from_mat(self.scene.center, scale, self.rot_mat, fov_deg, [
-            0.0, 0.0,
-        ]);
+        let camera =
+            CameraParams::from_mat(self.scene.center, scale, self.rot_mat, fov_deg, [0.0, 0.0]);
         let mut max_extent = 0.0f32;
         let mut saw_point = false;
 
@@ -468,6 +767,9 @@ impl App {
     }
 
     fn handle_mouse(&mut self, mouse: MouseEvent) {
+        if self.file_picker.is_some() {
+            return;
+        }
         match mouse.kind {
             MouseEventKind::Down(MouseButton::Left) => {
                 self.drag_last = Some((mouse.column, mouse.row));
@@ -480,8 +782,12 @@ impl App {
                     // around current Y axis, both via left-multiply.
                     let dpitch = drow * MOUSE_SENSITIVITY;
                     let dyaw = dcol * MOUSE_SENSITIVITY;
-                    self.rot_mat = mat_mul_3x3(mat_rot_x(dpitch), self.rot_mat);
-                    self.rot_mat = mat_mul_3x3(mat_rot_y(dyaw), self.rot_mat);
+                    if self.spin_lock {
+                        self.set_spin_direction([dpitch, dyaw, 0.0]);
+                    } else {
+                        self.rot_mat = mat_mul_3x3(mat_rot_x(dpitch), self.rot_mat);
+                        self.rot_mat = mat_mul_3x3(mat_rot_y(dyaw), self.rot_mat);
+                    }
                 }
                 self.drag_last = Some((mouse.column, mouse.row));
             }
@@ -512,11 +818,30 @@ impl App {
         };
         self.set_zoom(self.zoom * factor);
     }
+
+    fn apply_structure(&mut self, structure: Structure) {
+        self.structure = structure;
+        self.selected_atom = 0;
+        self.rebuild_scene();
+        self.cached_element_counts = element_counts(&self.structure.atoms);
+        self.cached_formula = empirical_formula(&self.cached_element_counts);
+    }
 }
 
-pub fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, structure: Structure) -> Result<()> {
-    let mut app = App::new(structure);
+pub fn run(
+    terminal: &mut Terminal<CrosstermBackend<Stdout>>,
+    structure: Option<Structure>,
+    open_dialog_dir: PathBuf,
+) -> Result<()> {
+    let mut app = if let Some(structure) = structure {
+        let mut app = App::new(structure);
+        app.open_dialog_dir = open_dialog_dir;
+        app
+    } else {
+        App::with_initial_structure(None, open_dialog_dir)
+    };
     let tick_rate = Duration::from_millis(16);
+    let mut previous_frame_time = std::time::Instant::now();
 
     while !app.should_quit {
         // Wait up to one tick for the first event, then drain any further
@@ -536,6 +861,14 @@ pub fn run(terminal: &mut Terminal<CrosstermBackend<Stdout>>, structure: Structu
                 break; // don't overrun into the next frame
             }
         }
+
+        let now = std::time::Instant::now();
+        let delta_seconds = now
+            .saturating_duration_since(previous_frame_time)
+            .as_secs_f32()
+            .clamp(0.0, 0.1);
+        previous_frame_time = now;
+        app.update_spin_motion(delta_seconds);
 
         terminal.draw(|frame| {
             draw(frame, &app);
@@ -557,24 +890,204 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
         .split(root[1]);
 
+    let viewport_block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title("3D View");
+    let viewport_inner = viewport_block.inner(root[0]);
     let viewport = render_viewport_text(
         app,
-        root[0].width.saturating_sub(2) as usize,
-        root[0].height.saturating_sub(2) as usize,
+        viewport_inner.width as usize,
+        viewport_inner.height as usize,
     );
-    let viewport_paragraph =
-        Paragraph::new(viewport).block(Block::default().borders(Borders::ALL).title("3D View"));
+    let viewport_paragraph = Paragraph::new(viewport).block(viewport_block);
     frame.render_widget(viewport_paragraph, root[0]);
 
+    let structure_block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title("Structure");
     let side = Paragraph::new(structure_panel_lines(app))
-        .block(Block::default().borders(Borders::ALL).title("Structure"))
+        .block(structure_block)
         .wrap(Wrap { trim: true });
     frame.render_widget(side, right[0]);
 
+    let controls_block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title("Controls");
     let view_panel = Paragraph::new(controls_keys_panel_lines(app))
-        .block(Block::default().borders(Borders::ALL).title("Controls"))
+        .block(controls_block)
         .wrap(Wrap { trim: true });
     frame.render_widget(view_panel, right[1]);
+
+    if let Some(file_picker) = &app.file_picker {
+        draw_file_picker(frame, file_picker);
+    }
+}
+
+fn draw_file_picker(frame: &mut ratatui::Frame, picker: &FilePickerState) {
+    let popup = centered_rect_sized(68, 22, frame.area());
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(" CIF Browser ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let max_inner_width = inner.width.saturating_sub(2) as usize;
+    let cwd_display = elide_from_left(&picker.cwd.display().to_string(), max_inner_width);
+    let mut lines: Vec<Line<'static>> = vec![
+        Line::from(Span::styled(
+            format!("cwd {}", cwd_display),
+            Style::default()
+                .fg(Color::LightBlue)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(
+            "j/k move  Enter open  <- parent  Esc close",
+            Style::default().fg(Color::Gray),
+        )),
+        Line::default(),
+    ];
+
+    let has_error = picker.error.is_some();
+    let top_reserved = 3usize;
+    let bottom_reserved = if has_error { 3usize } else { 1usize };
+    let max_entries = inner
+        .height
+        .saturating_sub((top_reserved + bottom_reserved) as u16) as usize;
+
+    if picker.entries.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "(no folders or .cif files)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    } else {
+        let visible_count = max_entries.max(1).min(picker.entries.len());
+        let mut start = picker.selected.saturating_sub(visible_count / 2);
+        if start + visible_count > picker.entries.len() {
+            start = picker.entries.len().saturating_sub(visible_count);
+        }
+        let end = (start + visible_count).min(picker.entries.len());
+
+        if start > 0 {
+            lines.push(Line::from(Span::styled(
+                "  ...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+
+        for (idx, entry) in picker.entries[start..end].iter().enumerate() {
+            let absolute_idx = start + idx;
+            let is_last_visible =
+                absolute_idx + 1 == picker.entries.len() || idx + 1 == end - start;
+            let selected = absolute_idx == picker.selected;
+            let marker = if selected { "❯" } else { " " };
+            let branch = if is_last_visible { "└─" } else { "├─" };
+            let item = if entry.is_dir {
+                format!("{branch} ▸ {}/", entry.name)
+            } else {
+                format!("{branch} ◦ {}", entry.name)
+            };
+            let item = elide_right(&item, max_inner_width.saturating_sub(4));
+            let color = if entry.is_dir {
+                Color::LightCyan
+            } else {
+                Color::LightGreen
+            };
+            let style = if selected {
+                Style::default()
+                    .fg(color)
+                    .bg(Color::DarkGray)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(color)
+            };
+            lines.push(Line::from(vec![
+                Span::styled(
+                    format!("{marker} "),
+                    Style::default().fg(Color::LightYellow),
+                ),
+                Span::styled(item, style),
+            ]));
+        }
+
+        if end < picker.entries.len() {
+            lines.push(Line::from(Span::styled(
+                "  ...",
+                Style::default().fg(Color::DarkGray),
+            )));
+        }
+    }
+
+    if let Some(error) = &picker.error {
+        lines.push(Line::default());
+        lines.push(Line::from(Span::styled(
+            elide_right(&format!("error: {error}"), max_inner_width),
+            Style::default().fg(Color::LightRed),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn centered_rect_sized(width: u16, height: u16, area: Rect) -> Rect {
+    let usable_width = area.width.saturating_sub(2).max(10);
+    let usable_height = area.height.saturating_sub(2).max(8);
+    let width = width.min(usable_width).max(10);
+    let height = height.min(usable_height).max(8);
+    Rect {
+        x: area.x + area.width.saturating_sub(width) / 2,
+        y: area.y + area.height.saturating_sub(height) / 2,
+        width,
+        height,
+    }
+}
+
+fn elide_right(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars - 3;
+    let mut out = String::new();
+    for ch in text.chars().take(keep) {
+        out.push(ch);
+    }
+    out.push_str("...");
+    out
+}
+
+fn elide_from_left(text: &str, max_chars: usize) -> String {
+    if max_chars == 0 {
+        return String::new();
+    }
+    let char_count = text.chars().count();
+    if char_count <= max_chars {
+        return text.to_string();
+    }
+    if max_chars <= 3 {
+        return ".".repeat(max_chars);
+    }
+    let keep = max_chars - 3;
+    let tail: String = text
+        .chars()
+        .rev()
+        .take(keep)
+        .collect::<Vec<_>>()
+        .into_iter()
+        .rev()
+        .collect();
+    format!("...{tail}")
 }
 
 fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
@@ -664,10 +1177,7 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
                 Style::default().fg(atom_col).add_modifier(Modifier::BOLD),
             ),
             Span::styled("  ", Style::default()),
-            Span::styled(
-                atom.element.clone(),
-                Style::default().fg(atom_col),
-            ),
+            Span::styled(atom.element.clone(), Style::default().fg(atom_col)),
         ]));
         lines.push(Line::from(vec![
             Span::styled("x ", Style::default().fg(Color::Red)),
@@ -721,11 +1231,19 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
 
     vec![
         section_header("VIEW"),
+        control_short_value_line("Shift+O", "Open", "CIF dialog".to_string(), Color::Gray),
         control_short_value_line(
             "g",
             "Theme",
             app.render_theme.label().to_string(),
             theme_color(app.render_theme),
+        ),
+        control_short_bool_line("R", "Spin lock", app.spin_lock),
+        control_short_value_line(
+            "<>",
+            "Spin speed",
+            format!("{:.2}x", app.spin_speed),
+            Color::LightYellow,
         ),
         control_short_bool_line("b", "Bonds", app.show_bonds),
         control_short_bool_line("c", "Cell", app.show_cell),
@@ -1130,12 +1648,20 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         };
     }
     if app.scene.atoms.is_empty() {
-        let message = "No atoms loaded";
+        let message = EMPTY_VIEW_HINT;
         let mut chars = vec![' '; width * height];
         let mut colors = vec![Color::Reset; width * height];
-        for (i, ch) in message.chars().enumerate().take(width) {
-            chars[i] = ch;
-            colors[i] = LABEL_COLOR;
+        let row = height / 2;
+        let message_len = message.chars().count();
+        let start_col = width.saturating_sub(message_len) / 2;
+        for (offset, ch) in message.chars().enumerate() {
+            let col = start_col + offset;
+            if col >= width {
+                break;
+            }
+            let idx = row * width + col;
+            chars[idx] = ch;
+            colors[idx] = LABEL_COLOR;
         }
         return ViewportBuffer { chars, colors };
     }
@@ -1667,7 +2193,6 @@ fn dist3_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
     dx * dx + dy * dy + dz * dz
 }
 
-
 #[derive(Debug, Clone, Copy)]
 struct ProjectedPoint {
     x: f32,
@@ -1980,15 +2505,19 @@ fn mat_mul_3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
 /// Build R = Rz(roll) · Ry(yaw) · Rx(pitch) — the same convention used by
 /// the original Euler-angle code, kept for snap-view initialization.
 fn mat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [[f32; 3]; 3] {
-    mat_mul_3x3(mat_rot_z(roll), mat_mul_3x3(mat_rot_y(yaw), mat_rot_x(pitch)))
+    mat_mul_3x3(
+        mat_rot_z(roll),
+        mat_mul_3x3(mat_rot_y(yaw), mat_rot_x(pitch)),
+    )
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MIN_FOV_DEG,
-        MOUSE_SENSITIVITY, RenderTheme, ViewportTransform, best_image_shift_and_distance,
-        boundary_axis_shifts, build_scene, mat_from_euler, project_world, render_viewport,
+        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MAX_SPIN_SPEED,
+        MIN_FOV_DEG, MIN_SPIN_SPEED, MOUSE_SENSITIVITY, RenderTheme, ViewportTransform,
+        best_image_shift_and_distance, boundary_axis_shifts, build_scene, mat_from_euler,
+        project_world, render_viewport,
     };
     use crate::cif::parse_cif_str;
     use crate::model::{Atom, Cell, Structure};
@@ -2403,6 +2932,78 @@ mod tests {
     }
 
     #[test]
+    fn spin_lock_directional_input_starts_continuous_rotation() {
+        let structure = Structure {
+            title: "spin lock test".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+        };
+        let mut app = App::new(structure);
+        let initial = app.rot_mat;
+
+        app.handle_key_press(KeyCode::Char('R'));
+        assert!(app.spin_lock);
+        app.handle_key_press(KeyCode::Char('l'));
+        assert!(app.spin_velocity[1] > 0.99);
+        app.update_spin_motion(0.05);
+
+        let mut changed = false;
+        for i in 0..3 {
+            for j in 0..3 {
+                if (app.rot_mat[i][j] - initial[i][j]).abs() > 1e-6 {
+                    changed = true;
+                }
+            }
+        }
+        assert!(
+            changed,
+            "rotation matrix should change while spin lock is active"
+        );
+
+        app.handle_key_press(KeyCode::Char('R'));
+        assert!(!app.spin_lock);
+        assert_eq!(app.spin_velocity, [0.0, 0.0, 0.0]);
+        let after_disable = app.rot_mat;
+        app.update_spin_motion(0.05);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((app.rot_mat[i][j] - after_disable[i][j]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn spin_speed_keys_adjust_and_clamp() {
+        let structure = Structure {
+            title: "spin speed test".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+        };
+        let mut app = App::new(structure);
+        let initial = app.spin_speed;
+
+        app.handle_key_press(KeyCode::Char('>'));
+        assert!(app.spin_speed > initial);
+
+        for _ in 0..200 {
+            app.handle_key_press(KeyCode::Char('>'));
+        }
+        assert!((app.spin_speed - MAX_SPIN_SPEED).abs() < 1e-6);
+
+        for _ in 0..400 {
+            app.handle_key_press(KeyCode::Char('<'));
+        }
+        assert!((app.spin_speed - MIN_SPIN_SPEED).abs() < 1e-6);
+    }
+
+    #[test]
     fn toggles_orientation_gizmo_mode() {
         let structure = Structure {
             title: "gizmo toggle test".to_string(),
@@ -2698,9 +3299,33 @@ mod tests {
 
         let test_cases: &[([f32; 3], [f32; 3], f32, [f32; 2], f32, f32, [f32; 2])] = &[
             // (position, center, scale, rotation, roll, fov_deg, pan)
-            ([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], 1.0, [0.0, 0.0], 0.0, 45.0, [0.0, 0.0]),
-            ([1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 2.0, [0.3, 0.7], 0.1, 60.0, [0.1, -0.2]),
-            ([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], 0.5, [-0.5, 1.2], 0.8, 30.0, [0.0, 0.0]),
+            (
+                [1.0, 2.0, 3.0],
+                [0.0, 0.0, 0.0],
+                1.0,
+                [0.0, 0.0],
+                0.0,
+                45.0,
+                [0.0, 0.0],
+            ),
+            (
+                [1.0, 0.0, 0.0],
+                [0.5, 0.0, 0.0],
+                2.0,
+                [0.3, 0.7],
+                0.1,
+                60.0,
+                [0.1, -0.2],
+            ),
+            (
+                [0.5, 0.5, 0.5],
+                [0.0, 0.0, 0.0],
+                0.5,
+                [-0.5, 1.2],
+                0.8,
+                30.0,
+                [0.0, 0.0],
+            ),
         ];
 
         for &(position, center, scale, rotation, roll, fov_deg, pan) in test_cases {
@@ -2759,10 +3384,26 @@ mod tests {
         use super::{RenderAtom, SceneGeometry};
 
         let atoms = vec![
-            RenderAtom { base_index: 0, position: [1.0, 0.0, 0.0], is_image: false },
-            RenderAtom { base_index: 1, position: [-1.0, 0.0, 0.0], is_image: false },
-            RenderAtom { base_index: 2, position: [0.0, 1.0, 0.0], is_image: false },
-            RenderAtom { base_index: 3, position: [0.0, 0.0, 1.0], is_image: false },
+            RenderAtom {
+                base_index: 0,
+                position: [1.0, 0.0, 0.0],
+                is_image: false,
+            },
+            RenderAtom {
+                base_index: 1,
+                position: [-1.0, 0.0, 0.0],
+                is_image: false,
+            },
+            RenderAtom {
+                base_index: 2,
+                position: [0.0, 1.0, 0.0],
+                is_image: false,
+            },
+            RenderAtom {
+                base_index: 3,
+                position: [0.0, 0.0, 1.0],
+                is_image: false,
+            },
         ];
         let scene = SceneGeometry {
             atoms,
@@ -2775,7 +3416,10 @@ mod tests {
         use super::bounding_sphere_scale;
         let scale = bounding_sphere_scale(&scene);
         // Max distance = 1.0, so scale = 0.92 / 1.0 = 0.92
-        assert!((scale - 0.92).abs() < 1e-5, "expected scale ≈ 0.92, got {scale}");
+        assert!(
+            (scale - 0.92).abs() < 1e-5,
+            "expected scale ≈ 0.92, got {scale}"
+        );
     }
 
     #[test]
