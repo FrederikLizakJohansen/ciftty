@@ -5,7 +5,8 @@ use std::time::Duration;
 
 use anyhow::Result;
 use crossterm::event::{
-    self, Event, KeyCode, KeyEvent, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
+    self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
+    MouseEventKind,
 };
 use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
@@ -32,7 +33,9 @@ const BOUNDARY_EPSILON: f32 = 0.02;
 // the entire cell wireframe behind all atoms.
 const CELL_LINE_DEPTH_BIAS: f32 = 1e-3;
 const BOND_LINE_DEPTH_BIAS: f32 = 900.0;
-const MOUSE_SENSITIVITY: f32 = 0.01; // radians per terminal column/row dragged
+const MOUSE_SENSITIVITY: f32 = 0.03; // radians per terminal column/row dragged
+const MOUSE_WHEEL_ZOOM_FACTOR: f32 = 1.1;
+const MOUSE_WHEEL_FOV_STEP_DEG: f32 = 2.0;
 // Terminal character cells are roughly twice as tall as wide in pixels.
 const CHAR_ASPECT: f32 = 2.0;
 const DEFAULT_BOND_MAX_DISTANCE: f32 = 2.2;
@@ -134,8 +137,10 @@ pub struct App {
     structure: Structure,
     scene: SceneGeometry,
     base_scale: f32, // rotation-invariant fit scale, computed once from bounding sphere
-    rotation: [f32; 2], // pitch, yaw
-    roll: f32,
+    /// Current view rotation as a 3×3 matrix (Rz·Ry·Rx convention).
+    /// Each key press / mouse drag left-multiplies by an elementary camera-space
+    /// rotation, keeping 'k' == "tilt top toward viewer" at any orientation.
+    rot_mat: [[f32; 3]; 3],
     zoom: f32,
     fov_deg: f32,
     lock_fov_zoom: bool,
@@ -154,6 +159,10 @@ pub struct App {
     should_quit: bool,
     /// Column/row of the last mouse-drag position, for delta calculation.
     drag_last: Option<(u16, u16)>,
+    /// Cached element → count map, derived from structure.atoms (immutable).
+    cached_element_counts: BTreeMap<String, usize>,
+    /// Cached Hill-order empirical formula derived from cached_element_counts.
+    cached_formula: String,
 }
 
 impl App {
@@ -168,13 +177,15 @@ impl App {
             bond_max_distance,
         );
         let base_scale = bounding_sphere_scale(&scene);
+        // Compute once — structure.atoms is immutable after construction.
+        let cached_element_counts = element_counts(&structure.atoms);
+        let cached_formula = empirical_formula(&cached_element_counts);
         Self {
             structure,
             scene,
             base_scale,
             // Start in an oblique view so periodic images do not collapse onto each other.
-            rotation: [0.35, 0.45],
-            roll: 0.0,
+            rot_mat: mat_from_euler(0.35, 0.45, 0.0),
             zoom: 1.0,
             fov_deg: DEFAULT_FOV_DEG,
             lock_fov_zoom: true,
@@ -192,6 +203,8 @@ impl App {
             selected_atom: 0,
             should_quit: false,
             drag_last: None,
+            cached_element_counts,
+            cached_formula,
         }
     }
 
@@ -244,13 +257,28 @@ impl App {
     }
 
     fn apply_continuous_key(&mut self, code: KeyCode) {
+        // Rotations left-multiply the current matrix so they act in CAMERA
+        // space: 'k' always tilts the top toward the viewer, 'h' always
+        // rotates around the current up axis, regardless of prior orientation.
         match code {
-            KeyCode::Char('h') => self.rotation[1] -= ROTATION_STEP,
-            KeyCode::Char('l') => self.rotation[1] += ROTATION_STEP,
-            KeyCode::Char('j') => self.rotation[0] += ROTATION_STEP,
-            KeyCode::Char('k') => self.rotation[0] -= ROTATION_STEP,
-            KeyCode::Char('u') => self.roll -= ROLL_STEP,
-            KeyCode::Char('o') => self.roll += ROLL_STEP,
+            KeyCode::Char('h') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_y(-ROTATION_STEP), self.rot_mat)
+            }
+            KeyCode::Char('l') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_y(ROTATION_STEP), self.rot_mat)
+            }
+            KeyCode::Char('j') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_x(ROTATION_STEP), self.rot_mat)
+            }
+            KeyCode::Char('k') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_x(-ROTATION_STEP), self.rot_mat)
+            }
+            KeyCode::Char('u') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_z(-ROLL_STEP), self.rot_mat)
+            }
+            KeyCode::Char('o') => {
+                self.rot_mat = mat_mul_3x3(mat_rot_z(ROLL_STEP), self.rot_mat)
+            }
             KeyCode::Char('w') => self.pan[1] += PAN_STEP,
             KeyCode::Char('s') => self.pan[1] -= PAN_STEP,
             KeyCode::Char('a') => self.pan[0] -= PAN_STEP,
@@ -328,21 +356,18 @@ impl App {
 
     fn projected_reference_extent(&self, zoom: f32, fov_deg: f32) -> Option<f32> {
         let scale = self.base_scale * zoom.max(MIN_ZOOM);
+        // Precompute rotation matrix and focal once — this function is called
+        // repeatedly inside the binary search in solve_zoom_for_extent.
+        let camera = CameraParams::from_mat(self.scene.center, scale, self.rot_mat, fov_deg, [
+            0.0, 0.0,
+        ]);
         let mut max_extent = 0.0f32;
         let mut saw_point = false;
 
         if !self.scene.cell_edges.is_empty() {
             for (start, end) in &self.scene.cell_edges {
                 for p in [*start, *end] {
-                    let Some(pr) = project_world(
-                        p,
-                        self.scene.center,
-                        scale,
-                        self.rotation,
-                        self.roll,
-                        fov_deg,
-                        [0.0, 0.0],
-                    ) else {
+                    let Some(pr) = camera.project(p) else {
                         continue;
                     };
                     if !pr.x.is_finite() || !pr.y.is_finite() {
@@ -354,15 +379,7 @@ impl App {
             }
         } else {
             for atom in &self.scene.atoms {
-                let Some(pr) = project_world(
-                    atom.position,
-                    self.scene.center,
-                    scale,
-                    self.rotation,
-                    self.roll,
-                    fov_deg,
-                    [0.0, 0.0],
-                ) else {
+                let Some(pr) = camera.project(atom.position) else {
                     continue;
                 };
                 if !pr.x.is_finite() || !pr.y.is_finite() {
@@ -441,14 +458,12 @@ impl App {
         let pitch = axis[1].atan2(axis[2]);
         let yz_len = (axis[1] * axis[1] + axis[2] * axis[2]).sqrt();
         let yaw = (-axis[0]).atan2(yz_len);
-        self.rotation = [pitch, yaw];
-        self.roll = 0.0;
+        self.rot_mat = mat_from_euler(pitch, yaw, 0.0);
         self.pan = [0.0, 0.0];
     }
 
     fn snap_view_isometric(&mut self) {
-        self.rotation = [ISO_PITCH, ISO_YAW];
-        self.roll = 0.0;
+        self.rot_mat = mat_from_euler(ISO_PITCH, ISO_YAW, 0.0);
         self.pan = [0.0, 0.0];
     }
 
@@ -461,16 +476,41 @@ impl App {
                 if let Some((last_col, last_row)) = self.drag_last {
                     let dcol = -(mouse.column as f32 - last_col as f32) / CHAR_ASPECT;
                     let drow = -(mouse.row as f32 - last_row as f32);
-                    self.rotation[1] += dcol * MOUSE_SENSITIVITY;
-                    self.rotation[0] += drow * MOUSE_SENSITIVITY;
+                    // Camera-space: apply pitch around current X axis, then yaw
+                    // around current Y axis, both via left-multiply.
+                    let dpitch = drow * MOUSE_SENSITIVITY;
+                    let dyaw = dcol * MOUSE_SENSITIVITY;
+                    self.rot_mat = mat_mul_3x3(mat_rot_x(dpitch), self.rot_mat);
+                    self.rot_mat = mat_mul_3x3(mat_rot_y(dyaw), self.rot_mat);
                 }
                 self.drag_last = Some((mouse.column, mouse.row));
             }
             MouseEventKind::Up(MouseButton::Left) => {
                 self.drag_last = None;
             }
+            MouseEventKind::ScrollUp => self.handle_scroll_wheel(true, mouse.modifiers),
+            MouseEventKind::ScrollDown => self.handle_scroll_wheel(false, mouse.modifiers),
             _ => {}
         }
+    }
+
+    fn handle_scroll_wheel(&mut self, scroll_up: bool, modifiers: KeyModifiers) {
+        if modifiers.contains(KeyModifiers::CONTROL) {
+            let delta = if scroll_up {
+                -MOUSE_WHEEL_FOV_STEP_DEG
+            } else {
+                MOUSE_WHEEL_FOV_STEP_DEG
+            };
+            self.set_fov(self.fov_deg + delta);
+            return;
+        }
+
+        let factor = if scroll_up {
+            MOUSE_WHEEL_ZOOM_FACTOR
+        } else {
+            1.0 / MOUSE_WHEEL_ZOOM_FACTOR
+        };
+        self.set_zoom(self.zoom * factor);
     }
 }
 
@@ -540,8 +580,8 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     let selected = app.structure.atoms.get(app.selected_atom);
     let total_atoms = app.structure.atoms.len();
-    let element_counts = element_counts(&app.structure.atoms);
-    let formula = empirical_formula(&element_counts);
+    let element_counts = &app.cached_element_counts;
+    let formula = app.cached_formula.clone();
 
     let mut lines = vec![
         kv_line(
@@ -551,7 +591,7 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
             Color::White,
         ),
         kv_line("Formula", formula, Color::Cyan, Color::LightYellow),
-        elements_line(&element_counts),
+        elements_line(element_counts),
         kv_line(
             "Atom sites",
             total_atoms.to_string(),
@@ -720,13 +760,13 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
         ),
         control_short_bool_line("z", "FOV lock", app.lock_fov_zoom),
         control_short_value_line(
-            "+/ -",
+            "+/-, wheel",
             "Zoom",
             format!("{:.2}", app.zoom),
             Color::LightYellow,
         ),
         control_short_value_line(
-            ",/.",
+            ",/., Ctrl+wheel",
             "FOV",
             format!("{:.1} deg", app.fov_deg),
             Color::LightYellow,
@@ -740,10 +780,11 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
         control_short_value_line(
             "h/j/k/l,u/o",
             "Rot",
-            format!(
-                "p {:.2} y {:.2} r {:.2}",
-                app.rotation[0], app.rotation[1], app.roll
-            ),
+            {
+                // Show the camera's look direction (row 2 of the rotation matrix).
+                let d = app.rot_mat[2];
+                format!("d {:.2} {:.2} {:.2}", d[0], d[1], d[2])
+            },
             Color::White,
         ),
         control_short_value_line(
@@ -975,6 +1016,108 @@ impl ViewportTransform {
     }
 }
 
+/// Precomputed camera state for a single frame.
+///
+/// Building this once per frame avoids recomputing trig values (sin/cos, tan)
+/// for every projected point. The rotation matrix combines Rx(pitch), Ry(yaw),
+/// and Rz(roll) into a single 3×3 matrix so each point transform is 9 muls +
+/// 6 adds instead of 3 × sin_cos + 12 muls.
+#[derive(Clone, Copy)]
+struct CameraParams {
+    center: [f32; 3],
+    scale: f32,
+    /// Combined rotation matrix: Rz(roll) · Ry(yaw) · Rx(pitch)
+    rot: [[f32; 3]; 3],
+    /// Focal length: 1 / tan(fov / 2)
+    focal: f32,
+    pan: [f32; 2],
+}
+
+impl CameraParams {
+    /// Euler-angle constructor kept for use by the test-only `project_world` wrapper.
+    #[cfg(test)]
+    fn new(
+        center: [f32; 3],
+        scale: f32,
+        rotation: [f32; 2],
+        roll: f32,
+        fov_deg: f32,
+        pan: [f32; 2],
+    ) -> Self {
+        let (spitch, cpitch) = rotation[0].sin_cos();
+        let (syaw, cyaw) = rotation[1].sin_cos();
+        let (sroll, croll) = roll.sin_cos();
+        // Rz(roll) · Ry(yaw) · Rx(pitch) — derived by multiplying the three
+        // elementary rotation matrices in application order.
+        let rot = [
+            [
+                cyaw * croll,
+                croll * syaw * spitch - sroll * cpitch,
+                croll * syaw * cpitch + sroll * spitch,
+            ],
+            [
+                cyaw * sroll,
+                sroll * syaw * spitch + croll * cpitch,
+                sroll * syaw * cpitch - croll * spitch,
+            ],
+            [-syaw, cyaw * spitch, cyaw * cpitch],
+        ];
+        Self {
+            center,
+            scale,
+            rot,
+            focal: 1.0 / (0.5 * fov_deg.to_radians()).tan(),
+            pan,
+        }
+    }
+
+    /// Construct from an already-computed rotation matrix (the normal hot path).
+    fn from_mat(
+        center: [f32; 3],
+        scale: f32,
+        rot: [[f32; 3]; 3],
+        fov_deg: f32,
+        pan: [f32; 2],
+    ) -> Self {
+        Self {
+            center,
+            scale,
+            rot,
+            focal: 1.0 / (0.5 * fov_deg.to_radians()).tan(),
+            pan,
+        }
+    }
+
+    fn project(&self, position: [f32; 3]) -> Option<ProjectedPoint> {
+        let lx = position[0] - self.center[0];
+        let ly = position[1] - self.center[1];
+        let lz = position[2] - self.center[2];
+        let m = &self.rot;
+        let rx = m[0][0] * lx + m[0][1] * ly + m[0][2] * lz;
+        let ry = m[1][0] * lx + m[1][1] * ly + m[1][2] * lz;
+        let rz = m[2][0] * lx + m[2][1] * ly + m[2][2] * lz;
+
+        let sx = rx * self.scale;
+        let sy = ry * self.scale;
+        let sz = rz * self.scale;
+
+        let depth = CAMERA_DISTANCE + sz;
+        if depth <= 1e-3 {
+            return None;
+        }
+        let screen_scale = self.focal / depth;
+        if !screen_scale.is_finite() || screen_scale > MAX_SCREEN_SCALE {
+            return None;
+        }
+        Some(ProjectedPoint {
+            x: sx * screen_scale + self.pan[0],
+            y: sy * screen_scale + self.pan[1],
+            z: depth,
+            screen_scale,
+        })
+    }
+}
+
 fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuffer {
     if width == 0 || height == 0 {
         return ViewportBuffer {
@@ -1000,6 +1143,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
     let Some(viewport) = ViewportTransform::for_size(width, height) else {
         return ViewportBuffer { chars, colors };
     };
+    // Build camera params once — avoids recomputing trig values per point.
+    let camera = CameraParams::from_mat(app.scene.center, scale, app.rot_mat, app.fov_deg, app.pan);
 
     if app.show_cell && !app.cell_on_top {
         for (start, end) in &app.scene.cell_edges {
@@ -1014,12 +1159,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 *end,
                 app.render_theme.cell_line_glyph(),
                 app.render_theme.cell_line_color(),
-                app.scene.center,
-                scale,
-                app.rotation,
-                app.roll,
-                app.fov_deg,
-                app.pan,
+                &camera,
                 CELL_LINE_DEPTH_BIAS,
                 false,
             );
@@ -1039,12 +1179,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 bond.end,
                 app.render_theme.bond_line_glyph(),
                 app.render_theme.bond_line_color(),
-                app.scene.center,
-                scale,
-                app.rotation,
-                app.roll,
-                app.fov_deg,
-                app.pan,
+                &camera,
                 BOND_LINE_DEPTH_BIAS,
                 false,
             );
@@ -1057,18 +1192,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         .scene
         .atoms
         .iter()
-        .filter_map(|atom| {
-            let p = project_world(
-                atom.position,
-                app.scene.center,
-                scale,
-                app.rotation,
-                app.roll,
-                app.fov_deg,
-                app.pan,
-            )?;
-            Some((atom, p))
-        })
+        .filter_map(|atom| Some((atom, camera.project(atom.position)?)))
         .collect();
 
     // Sort back-to-front (largest z = furthest away drawn first).
@@ -1163,12 +1287,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 *end,
                 app.render_theme.cell_line_glyph(),
                 app.render_theme.cell_line_color(),
-                app.scene.center,
-                scale,
-                app.rotation,
-                app.roll,
-                app.fov_deg,
-                app.pan,
+                &camera,
                 CELL_LINE_DEPTH_BIAS,
                 true,
             );
@@ -1176,14 +1295,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
     }
 
     if app.show_orientation_gizmo {
-        draw_orientation_gizmo(
-            &mut chars,
-            &mut colors,
-            width,
-            height,
-            app.rotation,
-            app.roll,
-        );
+        draw_orientation_gizmo(&mut chars, &mut colors, width, height, app.rot_mat);
     }
 
     ViewportBuffer { chars, colors }
@@ -1284,8 +1396,7 @@ fn draw_orientation_gizmo(
     colors: &mut [Color],
     width: usize,
     height: usize,
-    rotation: [f32; 2],
-    roll: f32,
+    rot_mat: [[f32; 3]; 3],
 ) {
     if width < 8 || height < 6 {
         return;
@@ -1300,31 +1411,15 @@ fn draw_orientation_gizmo(
         return;
     }
 
+    // Each world axis in camera space is a column of the rotation matrix:
+    //   R · e_x = column 0 = [rot_mat[0][0], rot_mat[1][0], rot_mat[2][0]]
+    let col0 = [rot_mat[0][0], rot_mat[1][0], rot_mat[2][0]];
+    let col1 = [rot_mat[0][1], rot_mat[1][1], rot_mat[2][1]];
+    let col2 = [rot_mat[0][2], rot_mat[1][2], rot_mat[2][2]];
     let mut axes = [
-        (
-            'x',
-            AXIS_X_COLOR,
-            rotate_z(
-                rotate_y(rotate_x([1.0, 0.0, 0.0], rotation[0]), rotation[1]),
-                roll,
-            ),
-        ),
-        (
-            'y',
-            AXIS_Y_COLOR,
-            rotate_z(
-                rotate_y(rotate_x([0.0, 1.0, 0.0], rotation[0]), rotation[1]),
-                roll,
-            ),
-        ),
-        (
-            'z',
-            AXIS_Z_COLOR,
-            rotate_z(
-                rotate_y(rotate_x([0.0, 0.0, 1.0], rotation[0]), rotation[1]),
-                roll,
-            ),
-        ),
+        ('x', AXIS_X_COLOR, col0),
+        ('y', AXIS_Y_COLOR, col1),
+        ('z', AXIS_Z_COLOR, col2),
     ];
     // Draw farther axes first so nearer axes remain readable.
     axes.sort_by(|a, b| b.2[2].partial_cmp(&a.2[2]).unwrap_or(Ordering::Equal));
@@ -1473,19 +1568,14 @@ fn rasterize_segment(
     end: [f32; 3],
     glyph: char,
     color: Color,
-    center: [f32; 3],
-    scale: f32,
-    rotation: [f32; 2],
-    roll: f32,
-    fov_deg: f32,
-    pan: [f32; 2],
+    camera: &CameraParams,
     depth_bias: f32,
     overlay: bool,
 ) {
-    let Some(p0) = project_world(start, center, scale, rotation, roll, fov_deg, pan) else {
+    let Some(p0) = camera.project(start) else {
         return;
     };
-    let Some(p1) = project_world(end, center, scale, rotation, roll, fov_deg, pan) else {
+    let Some(p1) = camera.project(end) else {
         return;
     };
 
@@ -1495,54 +1585,41 @@ fn rasterize_segment(
     let segment_len = (x1 - x0).abs().max((y1 - y0).abs() * CHAR_ASPECT);
     let samples = (segment_len.ceil() as usize).clamp(2, 600);
 
+    let max_row = height.saturating_sub(1) as f32;
+    let max_col = width.saturating_sub(1) as f32;
+
     for step in 0..=samples {
         let t = step as f32 / samples as f32;
-        let x = p0.x + (p1.x - p0.x) * t;
-        let y = p0.y + (p1.y - p0.y) * t;
+        // Interpolate directly in screen space — avoids a second
+        // screen_position() call per sample that would be redundant.
+        let sx_f = (x0 + (x1 - x0) * t).round();
+        let sy_f = (y0 + (y1 - y0) * t).round();
+        if !sx_f.is_finite() || !sy_f.is_finite() {
+            continue;
+        }
+        if sx_f < 0.0 || sy_f < 0.0 || sx_f > max_col || sy_f > max_row {
+            continue;
+        }
         // Keep helper geometry behind atom points at identical depth.
         let z = p0.z + (p1.z - p0.z) * t + depth_bias;
-        if let Some((sx, sy)) = screen_coords(x, y, width, height, viewport) {
-            let idx = sy * width + sx;
-            if overlay {
-                chars[idx] = glyph;
-                colors[idx] = color;
-                z_buffer[idx] = f32::NEG_INFINITY;
-                continue;
-            }
-            if z < z_buffer[idx] {
-                z_buffer[idx] = z;
-                chars[idx] = glyph;
-                colors[idx] = color;
-            }
+        let idx = sy_f as usize * width + sx_f as usize;
+        if overlay {
+            chars[idx] = glyph;
+            colors[idx] = color;
+            z_buffer[idx] = f32::NEG_INFINITY;
+            continue;
+        }
+        if z < z_buffer[idx] {
+            z_buffer[idx] = z;
+            chars[idx] = glyph;
+            colors[idx] = color;
         }
     }
 }
 
-fn screen_coords(
-    x: f32,
-    y: f32,
-    width: usize,
-    height: usize,
-    viewport: ViewportTransform,
-) -> Option<(usize, usize)> {
-    if !x.is_finite() || !y.is_finite() {
-        return None;
-    }
-    let (sx, sy) = viewport.screen_position(x, y);
-    let sx = sx.round();
-    let sy = sy.round();
-    if !sx.is_finite() || !sy.is_finite() {
-        return None;
-    }
-    if sx < 0.0 || sy < 0.0 {
-        return None;
-    }
-    if sx > (width - 1) as f32 || sy > (height - 1) as f32 {
-        return None;
-    }
-    Some((sx as usize, sy as usize))
-}
-
+/// Convenience wrapper used by tests.  Hot paths build a `CameraParams` once
+/// and call `camera.project()` directly to avoid per-point trig.
+#[cfg(test)]
 fn project_world(
     position: [f32; 3],
     center: [f32; 3],
@@ -1552,29 +1629,7 @@ fn project_world(
     fov_deg: f32,
     pan: [f32; 2],
 ) -> Option<ProjectedPoint> {
-    let p = transform_world(position, center, rotation, roll);
-    let sx = p[0] * scale;
-    let sy = p[1] * scale;
-    let sz = p[2] * scale;
-
-    let depth = CAMERA_DISTANCE + sz;
-    if depth <= 1e-3 {
-        return None;
-    }
-
-    let focal = 1.0 / (0.5 * fov_deg.to_radians()).tan();
-    let screen_scale = focal / depth;
-    if !screen_scale.is_finite() || screen_scale > MAX_SCREEN_SCALE {
-        return None;
-    }
-    let x = sx * screen_scale + pan[0];
-    let y = sy * screen_scale + pan[1];
-    Some(ProjectedPoint {
-        x,
-        y,
-        z: depth,
-        screen_scale,
-    })
+    CameraParams::new(center, scale, rotation, roll, fov_deg, pan).project(position)
 }
 
 /// Compute a rotation-invariant fit scale from the bounding-sphere radius.
@@ -1583,45 +1638,31 @@ fn project_world(
 /// the scale is the same for every orientation, so the apparent centre of
 /// rotation stays fixed on screen as the user rotates.
 fn bounding_sphere_scale(scene: &SceneGeometry) -> f32 {
-    let mut max_r = 1e-3f32;
+    // Compare squared distances to avoid a sqrt per point; one sqrt at the end.
+    let mut max_r_sq = (1e-3f32).powi(2);
 
     for atom in &scene.atoms {
-        max_r = max_r.max(dist3(atom.position, scene.center));
+        max_r_sq = max_r_sq.max(dist3_sq(atom.position, scene.center));
     }
     for (s, e) in &scene.cell_edges {
-        max_r = max_r.max(dist3(*s, scene.center));
-        max_r = max_r.max(dist3(*e, scene.center));
+        max_r_sq = max_r_sq.max(dist3_sq(*s, scene.center));
+        max_r_sq = max_r_sq.max(dist3_sq(*e, scene.center));
     }
     for bond in &scene.bonds {
-        max_r = max_r.max(dist3(bond.start, scene.center));
-        max_r = max_r.max(dist3(bond.end, scene.center));
+        max_r_sq = max_r_sq.max(dist3_sq(bond.start, scene.center));
+        max_r_sq = max_r_sq.max(dist3_sq(bond.end, scene.center));
     }
 
-    0.92 / max_r
+    0.92 / max_r_sq.sqrt()
 }
 
-fn dist3(a: [f32; 3], b: [f32; 3]) -> f32 {
+fn dist3_sq(a: [f32; 3], b: [f32; 3]) -> f32 {
     let dx = a[0] - b[0];
     let dy = a[1] - b[1];
     let dz = a[2] - b[2];
-    (dx * dx + dy * dy + dz * dz).sqrt()
+    dx * dx + dy * dy + dz * dz
 }
 
-fn transform_world(
-    position: [f32; 3],
-    center: [f32; 3],
-    rotation: [f32; 2],
-    roll: f32,
-) -> [f32; 3] {
-    let mut p = [
-        position[0] - center[0],
-        position[1] - center[1],
-        position[2] - center[2],
-    ];
-    p = rotate_x(p, rotation[0]);
-    p = rotate_y(p, rotation[1]);
-    rotate_z(p, roll)
-}
 
 #[derive(Debug, Clone, Copy)]
 struct ProjectedPoint {
@@ -1896,31 +1937,51 @@ fn vec_norm(v: [f32; 3]) -> f32 {
     (v[0] * v[0] + v[1] * v[1] + v[2] * v[2]).sqrt()
 }
 
-fn rotate_x(p: [f32; 3], angle: f32) -> [f32; 3] {
+// ── 3×3 rotation matrix helpers ──────────────────────────────────────────────
+
+fn mat_rot_x(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
-    [p[0], p[1] * c - p[2] * s, p[1] * s + p[2] * c]
+    [[1.0, 0.0, 0.0], [0.0, c, -s], [0.0, s, c]]
 }
 
-fn rotate_y(p: [f32; 3], angle: f32) -> [f32; 3] {
+fn mat_rot_y(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
-    [p[0] * c + p[2] * s, p[1], -p[0] * s + p[2] * c]
+    [[c, 0.0, s], [0.0, 1.0, 0.0], [-s, 0.0, c]]
 }
 
-fn rotate_z(p: [f32; 3], angle: f32) -> [f32; 3] {
+fn mat_rot_z(angle: f32) -> [[f32; 3]; 3] {
     let (s, c) = angle.sin_cos();
-    [p[0] * c - p[1] * s, p[0] * s + p[1] * c, p[2]]
+    [[c, -s, 0.0], [s, c, 0.0], [0.0, 0.0, 1.0]]
+}
+
+fn mat_mul_3x3(a: [[f32; 3]; 3], b: [[f32; 3]; 3]) -> [[f32; 3]; 3] {
+    let mut out = [[0.0f32; 3]; 3];
+    for i in 0..3 {
+        for j in 0..3 {
+            for k in 0..3 {
+                out[i][j] += a[i][k] * b[k][j];
+            }
+        }
+    }
+    out
+}
+
+/// Build R = Rz(roll) · Ry(yaw) · Rx(pitch) — the same convention used by
+/// the original Euler-angle code, kept for snap-view initialization.
+fn mat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [[f32; 3]; 3] {
+    mat_mul_3x3(mat_rot_z(roll), mat_mul_3x3(mat_rot_y(yaw), mat_rot_x(pitch)))
 }
 
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MIN_FOV_DEG, RenderTheme,
-        ViewportTransform, best_image_shift_and_distance, boundary_axis_shifts, build_scene,
-        project_world, render_viewport, transform_world,
+        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MIN_FOV_DEG,
+        MOUSE_SENSITIVITY, RenderTheme, ViewportTransform, best_image_shift_and_distance,
+        boundary_axis_shifts, build_scene, mat_from_euler, project_world, render_viewport,
     };
     use crate::cif::parse_cif_str;
     use crate::model::{Atom, Cell, Structure};
-    use crossterm::event::KeyCode;
+    use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
 
     #[test]
     fn detects_boundary_repeat_shifts() {
@@ -1997,13 +2058,93 @@ mod tests {
     }
 
     #[test]
+    fn mouse_drag_rotates_with_configured_sensitivity() {
+        let structure = Structure {
+            title: "mouse drag sensitivity test".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+        };
+        let mut app = App::new(structure);
+        // Start from identity so the expected result is unambiguous.
+        app.rot_mat = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]];
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 20,
+            row: 10,
+            modifiers: KeyModifiers::NONE,
+        });
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::Drag(MouseButton::Left),
+            column: 24,
+            row: 7,
+            modifiers: KeyModifiers::NONE,
+        });
+
+        let dpitch = (10.0 - 7.0_f32) * MOUSE_SENSITIVITY;
+        let dyaw = -((24.0 - 20.0_f32) / CHAR_ASPECT) * MOUSE_SENSITIVITY;
+        // Camera-space: pitch applied first, then yaw → mat_from_euler(dpitch, dyaw, 0)
+        // starting from identity.
+        let expected = mat_from_euler(dpitch, dyaw, 0.0);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (app.rot_mat[i][j] - expected[i][j]).abs() < 1e-5,
+                    "rot_mat[{i}][{j}]: got {} expected {}",
+                    app.rot_mat[i][j],
+                    expected[i][j]
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn mouse_wheel_zooms_and_ctrl_wheel_changes_fov() {
+        let structure = Structure {
+            title: "mouse wheel test".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [1.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+        };
+        let mut app = App::new(structure);
+        app.lock_fov_zoom = false;
+
+        let zoom_before_scroll = app.zoom;
+        let fov_before_scroll = app.fov_deg;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::NONE,
+        });
+        assert!(app.zoom > zoom_before_scroll);
+        assert!((app.fov_deg - fov_before_scroll).abs() < 1e-6);
+
+        let zoom_before_ctrl_scroll = app.zoom;
+        let fov_before_ctrl_scroll = app.fov_deg;
+        app.handle_mouse(MouseEvent {
+            kind: MouseEventKind::ScrollUp,
+            column: 0,
+            row: 0,
+            modifiers: KeyModifiers::CONTROL,
+        });
+        assert!((app.zoom - zoom_before_ctrl_scroll).abs() < 1e-6);
+        assert!(app.fov_deg < fov_before_ctrl_scroll);
+    }
+
+    #[test]
     fn extreme_perspective_settings_do_not_panic() {
         let cif = include_str!("../Fe.cif");
         let structure = parse_cif_str(cif, "fe_fixture").expect("Fe.cif should parse");
         let mut app = App::new(structure);
         app.fov_deg = MIN_FOV_DEG;
         app.zoom = 25.0;
-        app.rotation = [0.0, 0.0];
+        app.rot_mat = [[1.0, 0.0, 0.0], [0.0, 1.0, 0.0], [0.0, 0.0, 1.0]]; // identity
         app.pan = [0.0, 0.0];
 
         let _ = render_viewport(&app, 80, 30);
@@ -2310,7 +2451,6 @@ mod tests {
             space_group: None,
         };
         let mut app = App::new(structure);
-        let center = app.scene.center;
 
         for (key, axis) in [
             (KeyCode::Char('A'), cell.lattice[0]),
@@ -2318,15 +2458,22 @@ mod tests {
             (KeyCode::Char('C'), cell.lattice[2]),
         ] {
             app.handle_key_press(key);
-            let tip = [
-                center[0] + axis[0],
-                center[1] + axis[1],
-                center[2] + axis[2],
+            // Apply rot_mat directly: p_cam = R · (tip - center)
+            let m = app.rot_mat;
+            let aligned = [
+                m[0][0] * axis[0] + m[0][1] * axis[1] + m[0][2] * axis[2],
+                m[1][0] * axis[0] + m[1][1] * axis[1] + m[1][2] * axis[2],
             ];
-            let aligned = transform_world(tip, center, app.rotation, app.roll);
-            assert!(aligned[0].abs() < 1e-4);
-            assert!(aligned[1].abs() < 1e-4);
-            assert!(app.roll.abs() < 1e-6);
+            assert!(
+                aligned[0].abs() < 1e-4,
+                "axis x-component in camera space should be ~0, got {}",
+                aligned[0]
+            );
+            assert!(
+                aligned[1].abs() < 1e-4,
+                "axis y-component in camera space should be ~0, got {}",
+                aligned[1]
+            );
             assert!(app.pan[0].abs() < 1e-6);
             assert!(app.pan[1].abs() < 1e-6);
         }
@@ -2341,15 +2488,22 @@ mod tests {
             space_group: None,
         };
         let mut app = App::new(structure);
-        app.rotation = [0.0, 0.0];
-        app.roll = 0.2;
+        app.rot_mat = mat_from_euler(0.0, 0.0, 0.2); // some non-iso rotation with roll
         app.pan = [0.3, -0.4];
 
         app.handle_key_press(KeyCode::Char('i'));
 
-        assert!((app.rotation[0] - ISO_PITCH).abs() < 1e-6);
-        assert!((app.rotation[1] - ISO_YAW).abs() < 1e-6);
-        assert!(app.roll.abs() < 1e-6);
+        let expected = mat_from_euler(ISO_PITCH, ISO_YAW, 0.0);
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!(
+                    (app.rot_mat[i][j] - expected[i][j]).abs() < 1e-5,
+                    "rot_mat[{i}][{j}]: got {} expected {}",
+                    app.rot_mat[i][j],
+                    expected[i][j]
+                );
+            }
+        }
         assert!(app.pan[0].abs() < 1e-6);
         assert!(app.pan[1].abs() < 1e-6);
     }
@@ -2479,5 +2633,110 @@ mod tests {
 
     fn flatten_grid(s: &str) -> Vec<char> {
         s.lines().flat_map(|line| line.chars()).collect()
+    }
+
+    // ── Optimization regression tests ─────────────────────────────────────
+
+    #[test]
+    fn camera_params_project_matches_project_world() {
+        // Verify that CameraParams::project (via from_mat) produces identical
+        // results to the Euler-angle constructor used by project_world.
+        use super::CameraParams;
+
+        let test_cases: &[([f32; 3], [f32; 3], f32, [f32; 2], f32, f32, [f32; 2])] = &[
+            // (position, center, scale, rotation, roll, fov_deg, pan)
+            ([1.0, 2.0, 3.0], [0.0, 0.0, 0.0], 1.0, [0.0, 0.0], 0.0, 45.0, [0.0, 0.0]),
+            ([1.0, 0.0, 0.0], [0.5, 0.0, 0.0], 2.0, [0.3, 0.7], 0.1, 60.0, [0.1, -0.2]),
+            ([0.5, 0.5, 0.5], [0.0, 0.0, 0.0], 0.5, [-0.5, 1.2], 0.8, 30.0, [0.0, 0.0]),
+        ];
+
+        for &(position, center, scale, rotation, roll, fov_deg, pan) in test_cases {
+            let via_wrapper = project_world(position, center, scale, rotation, roll, fov_deg, pan);
+            let via_camera =
+                CameraParams::new(center, scale, rotation, roll, fov_deg, pan).project(position);
+
+            match (via_wrapper, via_camera) {
+                (None, None) => {}
+                (Some(a), Some(b)) => {
+                    assert!(
+                        (a.x - b.x).abs() < 1e-5,
+                        "x mismatch: project_world={} camera={}",
+                        a.x,
+                        b.x
+                    );
+                    assert!(
+                        (a.y - b.y).abs() < 1e-5,
+                        "y mismatch: project_world={} camera={}",
+                        a.y,
+                        b.y
+                    );
+                    assert!(
+                        (a.z - b.z).abs() < 1e-5,
+                        "z mismatch: project_world={} camera={}",
+                        a.z,
+                        b.z
+                    );
+                    assert!(
+                        (a.screen_scale - b.screen_scale).abs() < 1e-5,
+                        "screen_scale mismatch: {} vs {}",
+                        a.screen_scale,
+                        b.screen_scale
+                    );
+                }
+                (a, b) => panic!("projection agreement failure: {a:?} vs {b:?}"),
+            }
+        }
+    }
+
+    #[test]
+    fn dist3_sq_equals_dist_squared() {
+        use super::dist3_sq;
+        let a = [1.0f32, 2.0, 3.0];
+        let b = [4.0f32, 6.0, 3.0];
+        let sq = dist3_sq(a, b);
+        let manual = (4.0 - 1.0_f32).powi(2) + (6.0 - 2.0_f32).powi(2) + 0.0;
+        assert!((sq - manual).abs() < 1e-6);
+        assert!((sq.sqrt() - 5.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn bounding_sphere_scale_consistent_for_symmetric_scene() {
+        // A cell-less structure with atoms at ±1 on each axis should give a
+        // consistent scale regardless of order and without inflating from sqrt.
+        use super::{RenderAtom, SceneGeometry};
+
+        let atoms = vec![
+            RenderAtom { base_index: 0, position: [1.0, 0.0, 0.0], is_image: false },
+            RenderAtom { base_index: 1, position: [-1.0, 0.0, 0.0], is_image: false },
+            RenderAtom { base_index: 2, position: [0.0, 1.0, 0.0], is_image: false },
+            RenderAtom { base_index: 3, position: [0.0, 0.0, 1.0], is_image: false },
+        ];
+        let scene = SceneGeometry {
+            atoms,
+            bonds: vec![],
+            cell_edges: vec![],
+            center: [0.0, 0.0, 0.0],
+            boundary_image_count: 0,
+            bonded_image_count: 0,
+        };
+        use super::bounding_sphere_scale;
+        let scale = bounding_sphere_scale(&scene);
+        // Max distance = 1.0, so scale = 0.92 / 1.0 = 0.92
+        assert!((scale - 0.92).abs() < 1e-5, "expected scale ≈ 0.92, got {scale}");
+    }
+
+    #[test]
+    fn cached_formula_and_counts_match_direct_computation() {
+        // Ensure the cached values in App exactly equal what the free functions produce.
+        use super::{element_counts, empirical_formula};
+        let cif = include_str!("../U3Te4.cif");
+        let structure = parse_cif_str(cif, "u3te4").expect("should parse");
+        let app = App::new(structure.clone());
+
+        let expected_counts = element_counts(&structure.atoms);
+        let expected_formula = empirical_formula(&expected_counts);
+
+        assert_eq!(app.cached_element_counts, expected_counts);
+        assert_eq!(app.cached_formula, expected_formula);
     }
 }
