@@ -1,6 +1,7 @@
 mod app;
 mod cif;
 mod model;
+mod spacegroup;
 mod xrd;
 
 use std::env;

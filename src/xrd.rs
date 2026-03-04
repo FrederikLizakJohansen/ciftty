@@ -388,6 +388,7 @@ mod tests {
             }],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let pattern = compute_pattern(&structure, 1.5406, 90.0);
         assert!(pattern.peaks.is_empty());

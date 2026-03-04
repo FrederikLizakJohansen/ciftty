@@ -126,6 +126,21 @@ pub struct Structure {
     pub atoms: Vec<Atom>,
     pub cell: Option<Cell>,
     pub space_group: Option<String>,
+    pub asu_atoms: Vec<Atom>,
+    pub symmetry_ops: Vec<String>,
+}
+
+impl Default for Structure {
+    fn default() -> Self {
+        Self {
+            title: String::new(),
+            atoms: Vec::new(),
+            cell: None,
+            space_group: None,
+            asu_atoms: Vec::new(),
+            symmetry_ops: Vec::new(),
+        }
+    }
 }
 
 impl Structure {

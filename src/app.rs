@@ -18,7 +18,8 @@ use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
-use crate::model::{Cell, Structure};
+use crate::model::{Atom, Cell, Structure};
+use crate::spacegroup;
 use crate::xrd::{XrdPattern, compute_pattern};
 
 const WAVELENGTH_PRESETS: &[(&str, f32)] =
@@ -42,6 +43,7 @@ const BOUNDARY_EPSILON: f32 = 0.02;
 // the entire cell wireframe behind all atoms.
 const CELL_LINE_DEPTH_BIAS: f32 = 1e-3;
 const BOND_LINE_DEPTH_BIAS: f32 = 900.0;
+const EDITOR_ATOM_ROWS: usize = 5;
 const MOUSE_SENSITIVITY: f32 = 0.03; // radians per terminal column/row dragged
 const MOUSE_WHEEL_ZOOM_FACTOR: f32 = 1.1;
 const MOUSE_WHEEL_FOV_STEP_DEG: f32 = 2.0;
@@ -291,6 +293,498 @@ impl FilePickerState {
     }
 }
 
+// ── Editor types ─────────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone)]
+struct DraftAtom {
+    label: String,
+    element: String,
+    x: String,
+    y: String,
+    z: String,
+}
+
+impl DraftAtom {
+    fn from_atom(atom: &Atom) -> Self {
+        let frac = atom.fractional.unwrap_or(atom.position);
+        Self {
+            label: atom.label.clone(),
+            element: atom.element.clone(),
+            x: format!("{:.6}", frac[0]),
+            y: format!("{:.6}", frac[1]),
+            z: format!("{:.6}", frac[2]),
+        }
+    }
+
+    fn to_atom(&self) -> Option<Atom> {
+        let x = self.x.parse::<f32>().ok()?;
+        let y = self.y.parse::<f32>().ok()?;
+        let z = self.z.parse::<f32>().ok()?;
+        let frac = [x, y, z];
+        Some(Atom {
+            label: if self.label.is_empty() {
+                self.element.clone()
+            } else {
+                self.label.clone()
+            },
+            element: self.element.clone(),
+            position: frac,
+            fractional: Some(frac),
+        })
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EditorFocus {
+    Title,
+    CellA,
+    CellB,
+    CellC,
+    CellAlpha,
+    CellBeta,
+    CellGamma,
+    SpaceGroup,
+    AtomLabel(usize),
+    AtomElement(usize),
+    AtomX(usize),
+    AtomY(usize),
+    AtomZ(usize),
+}
+
+impl EditorFocus {
+    fn atom_row(&self) -> Option<usize> {
+        match self {
+            Self::AtomLabel(i)
+            | Self::AtomElement(i)
+            | Self::AtomX(i)
+            | Self::AtomY(i)
+            | Self::AtomZ(i) => Some(*i),
+            _ => None,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EditorState {
+    draft_title: String,
+    draft_a: String,
+    draft_b: String,
+    draft_c: String,
+    draft_alpha: String,
+    draft_beta: String,
+    draft_gamma: String,
+    draft_space_group: String,
+    resolved_sg_ops: Vec<String>,
+    resolved_sg_name: Option<String>,
+    draft_atoms: Vec<DraftAtom>,
+    focus: EditorFocus,
+    editing: bool,
+    cursor_pos: usize,
+    atom_scroll: usize,
+    source_path: Option<PathBuf>,
+    status: Option<String>,
+}
+
+impl EditorState {
+    fn new_empty() -> Self {
+        Self {
+            draft_title: "new_structure".to_string(),
+            draft_a: "5.000000".to_string(),
+            draft_b: "5.000000".to_string(),
+            draft_c: "5.000000".to_string(),
+            draft_alpha: "90.000000".to_string(),
+            draft_beta: "90.000000".to_string(),
+            draft_gamma: "90.000000".to_string(),
+            draft_space_group: "P1".to_string(),
+            resolved_sg_ops: vec!["x,y,z".to_string()],
+            resolved_sg_name: Some("P1".to_string()),
+            draft_atoms: vec![DraftAtom {
+                label: "A1".to_string(),
+                element: "X".to_string(),
+                x: "0.000000".to_string(),
+                y: "0.000000".to_string(),
+                z: "0.000000".to_string(),
+            }],
+            focus: EditorFocus::Title,
+            editing: false,
+            cursor_pos: 0,
+            atom_scroll: 0,
+            source_path: None,
+            status: None,
+        }
+    }
+
+    fn from_structure(structure: &Structure, path: Option<PathBuf>) -> Self {
+        let cell = structure.cell;
+        let (a, b, c, alpha, beta, gamma) = if let Some(c) = cell {
+            (c.a, c.b, c.c, c.alpha_deg, c.beta_deg, c.gamma_deg)
+        } else {
+            (5.0, 5.0, 5.0, 90.0, 90.0, 90.0)
+        };
+        let sg_str = structure
+            .space_group
+            .clone()
+            .unwrap_or_else(|| "P1".to_string());
+
+        // Resolve via spacegroup lookup.
+        let (resolved_ops, resolved_name) =
+            Self::resolve_sg(&sg_str, &structure.symmetry_ops);
+
+        let draft_atoms = if !structure.asu_atoms.is_empty() {
+            structure.asu_atoms.iter().map(DraftAtom::from_atom).collect()
+        } else {
+            structure.atoms.iter().map(DraftAtom::from_atom).collect()
+        };
+
+        Self {
+            draft_title: structure.title.clone(),
+            draft_a: format!("{a:.6}"),
+            draft_b: format!("{b:.6}"),
+            draft_c: format!("{c:.6}"),
+            draft_alpha: format!("{alpha:.6}"),
+            draft_beta: format!("{beta:.6}"),
+            draft_gamma: format!("{gamma:.6}"),
+            draft_space_group: sg_str,
+            resolved_sg_ops: resolved_ops,
+            resolved_sg_name: resolved_name,
+            draft_atoms,
+            focus: EditorFocus::Title,
+            editing: false,
+            cursor_pos: 0,
+            atom_scroll: 0,
+            source_path: path,
+            status: None,
+        }
+    }
+
+    fn resolve_sg(query: &str, fallback_ops: &[String]) -> (Vec<String>, Option<String>) {
+        if let Some(sg) = spacegroup::lookup(query) {
+            let ops = sg.ops.iter().map(|s| s.to_string()).collect();
+            return (ops, Some(sg.canonical_name.to_string()));
+        }
+        if !fallback_ops.is_empty() {
+            return (fallback_ops.to_vec(), None);
+        }
+        (vec!["x,y,z".to_string()], None)
+    }
+
+    fn get_field_text(&self, focus: EditorFocus) -> &str {
+        match focus {
+            EditorFocus::Title => &self.draft_title,
+            EditorFocus::CellA => &self.draft_a,
+            EditorFocus::CellB => &self.draft_b,
+            EditorFocus::CellC => &self.draft_c,
+            EditorFocus::CellAlpha => &self.draft_alpha,
+            EditorFocus::CellBeta => &self.draft_beta,
+            EditorFocus::CellGamma => &self.draft_gamma,
+            EditorFocus::SpaceGroup => &self.draft_space_group,
+            EditorFocus::AtomLabel(i) => {
+                self.draft_atoms.get(i).map(|a| a.label.as_str()).unwrap_or("")
+            }
+            EditorFocus::AtomElement(i) => {
+                self.draft_atoms.get(i).map(|a| a.element.as_str()).unwrap_or("")
+            }
+            EditorFocus::AtomX(i) => {
+                self.draft_atoms.get(i).map(|a| a.x.as_str()).unwrap_or("")
+            }
+            EditorFocus::AtomY(i) => {
+                self.draft_atoms.get(i).map(|a| a.y.as_str()).unwrap_or("")
+            }
+            EditorFocus::AtomZ(i) => {
+                self.draft_atoms.get(i).map(|a| a.z.as_str()).unwrap_or("")
+            }
+        }
+    }
+
+    fn set_field_text(&mut self, focus: EditorFocus, text: String) {
+        match focus {
+            EditorFocus::Title => self.draft_title = text,
+            EditorFocus::CellA => self.draft_a = text,
+            EditorFocus::CellB => self.draft_b = text,
+            EditorFocus::CellC => self.draft_c = text,
+            EditorFocus::CellAlpha => self.draft_alpha = text,
+            EditorFocus::CellBeta => self.draft_beta = text,
+            EditorFocus::CellGamma => self.draft_gamma = text,
+            EditorFocus::SpaceGroup => {
+                self.draft_space_group = text.clone();
+                let (ops, name) = Self::resolve_sg(&text, &[]);
+                self.resolved_sg_ops = ops;
+                self.resolved_sg_name = name;
+            }
+            EditorFocus::AtomLabel(i) => {
+                if let Some(a) = self.draft_atoms.get_mut(i) {
+                    a.label = text;
+                }
+            }
+            EditorFocus::AtomElement(i) => {
+                if let Some(a) = self.draft_atoms.get_mut(i) {
+                    a.element = text;
+                }
+            }
+            EditorFocus::AtomX(i) => {
+                if let Some(a) = self.draft_atoms.get_mut(i) {
+                    a.x = text;
+                }
+            }
+            EditorFocus::AtomY(i) => {
+                if let Some(a) = self.draft_atoms.get_mut(i) {
+                    a.y = text;
+                }
+            }
+            EditorFocus::AtomZ(i) => {
+                if let Some(a) = self.draft_atoms.get_mut(i) {
+                    a.z = text;
+                }
+            }
+        }
+    }
+
+    fn next_focus(&self) -> EditorFocus {
+        match self.focus {
+            EditorFocus::Title => EditorFocus::CellA,
+            EditorFocus::CellA => EditorFocus::CellB,
+            EditorFocus::CellB => EditorFocus::CellC,
+            EditorFocus::CellC => EditorFocus::CellAlpha,
+            EditorFocus::CellAlpha => EditorFocus::CellBeta,
+            EditorFocus::CellBeta => EditorFocus::CellGamma,
+            EditorFocus::CellGamma => EditorFocus::SpaceGroup,
+            EditorFocus::SpaceGroup => {
+                if self.draft_atoms.is_empty() {
+                    EditorFocus::Title
+                } else {
+                    EditorFocus::AtomLabel(0)
+                }
+            }
+            EditorFocus::AtomLabel(i) => EditorFocus::AtomElement(i),
+            EditorFocus::AtomElement(i) => EditorFocus::AtomX(i),
+            EditorFocus::AtomX(i) => EditorFocus::AtomY(i),
+            EditorFocus::AtomY(i) => EditorFocus::AtomZ(i),
+            EditorFocus::AtomZ(i) => {
+                let next = i + 1;
+                if next < self.draft_atoms.len() {
+                    EditorFocus::AtomLabel(next)
+                } else {
+                    EditorFocus::Title
+                }
+            }
+        }
+    }
+
+    fn prev_focus(&self) -> EditorFocus {
+        match self.focus {
+            EditorFocus::Title => {
+                if self.draft_atoms.is_empty() {
+                    EditorFocus::SpaceGroup
+                } else {
+                    EditorFocus::AtomZ(self.draft_atoms.len() - 1)
+                }
+            }
+            EditorFocus::CellA => EditorFocus::Title,
+            EditorFocus::CellB => EditorFocus::CellA,
+            EditorFocus::CellC => EditorFocus::CellB,
+            EditorFocus::CellAlpha => EditorFocus::CellC,
+            EditorFocus::CellBeta => EditorFocus::CellAlpha,
+            EditorFocus::CellGamma => EditorFocus::CellBeta,
+            EditorFocus::SpaceGroup => EditorFocus::CellGamma,
+            EditorFocus::AtomLabel(0) => EditorFocus::SpaceGroup,
+            EditorFocus::AtomLabel(i) => EditorFocus::AtomZ(i - 1),
+            EditorFocus::AtomElement(i) => EditorFocus::AtomLabel(i),
+            EditorFocus::AtomX(i) => EditorFocus::AtomElement(i),
+            EditorFocus::AtomY(i) => EditorFocus::AtomX(i),
+            EditorFocus::AtomZ(i) => EditorFocus::AtomY(i),
+        }
+    }
+
+    fn focus_row(&self) -> usize {
+        match self.focus {
+            EditorFocus::Title => 0,
+            EditorFocus::CellA | EditorFocus::CellB | EditorFocus::CellC => 1,
+            EditorFocus::CellAlpha | EditorFocus::CellBeta | EditorFocus::CellGamma => 2,
+            EditorFocus::SpaceGroup => 3,
+            EditorFocus::AtomLabel(i)
+            | EditorFocus::AtomElement(i)
+            | EditorFocus::AtomX(i)
+            | EditorFocus::AtomY(i)
+            | EditorFocus::AtomZ(i) => 4 + i,
+        }
+    }
+
+    fn focus_col(&self) -> usize {
+        match self.focus {
+            EditorFocus::Title | EditorFocus::SpaceGroup => 0,
+            EditorFocus::CellA | EditorFocus::CellAlpha | EditorFocus::AtomLabel(_) => 0,
+            EditorFocus::CellB | EditorFocus::CellBeta | EditorFocus::AtomElement(_) => 1,
+            EditorFocus::CellC | EditorFocus::CellGamma | EditorFocus::AtomX(_) => 2,
+            EditorFocus::AtomY(_) => 3,
+            EditorFocus::AtomZ(_) => 4,
+        }
+    }
+
+    fn focus_at(&self, row: usize, col: usize) -> EditorFocus {
+        match row {
+            0 => EditorFocus::Title,
+            1 => match col.min(2) {
+                0 => EditorFocus::CellA,
+                1 => EditorFocus::CellB,
+                _ => EditorFocus::CellC,
+            },
+            2 => match col.min(2) {
+                0 => EditorFocus::CellAlpha,
+                1 => EditorFocus::CellBeta,
+                _ => EditorFocus::CellGamma,
+            },
+            3 => EditorFocus::SpaceGroup,
+            r => {
+                let i = (r - 4).min(self.draft_atoms.len().saturating_sub(1));
+                match col.min(4) {
+                    0 => EditorFocus::AtomLabel(i),
+                    1 => EditorFocus::AtomElement(i),
+                    2 => EditorFocus::AtomX(i),
+                    3 => EditorFocus::AtomY(i),
+                    _ => EditorFocus::AtomZ(i),
+                }
+            }
+        }
+    }
+
+    fn ensure_atom_visible(&mut self, atom_row: usize) {
+        if atom_row < self.atom_scroll {
+            self.atom_scroll = atom_row;
+        } else if atom_row >= self.atom_scroll + EDITOR_ATOM_ROWS {
+            self.atom_scroll = atom_row + 1 - EDITOR_ATOM_ROWS;
+        }
+    }
+
+    fn move_up(&mut self) {
+        let row = self.focus_row();
+        let col = self.focus_col();
+        if row == 0 {
+            return;
+        }
+        let new_row = row - 1;
+        // SpaceGroup (row 3) is a single field — clamp col to 0 when landing on it.
+        let new_col = if new_row == 3 { 0 } else { col };
+        let new_focus = self.focus_at(new_row, new_col);
+        self.focus = new_focus;
+        if let Some(atom_row) = self.focus.atom_row() {
+            self.ensure_atom_visible(atom_row);
+        }
+    }
+
+    fn move_down(&mut self) {
+        let row = self.focus_row();
+        let col = self.focus_col();
+        // Atom index i lives at row 4+i, so last atom is at row 3+n.
+        // With 0 atoms, last valid row is 3 (SpaceGroup). With n atoms, it is 3+n.
+        if row >= 3 + self.draft_atoms.len() {
+            return;
+        }
+        let new_row = row + 1;
+        // Transitioning to SpaceGroup (row 3) — clamp col to 0.
+        let new_col = if row == 2 { 0 } else { col };
+        let new_focus = self.focus_at(new_row, new_col);
+        self.focus = new_focus;
+        if let Some(atom_row) = self.focus.atom_row() {
+            self.ensure_atom_visible(atom_row);
+        }
+    }
+
+    fn move_left(&mut self) {
+        let row = self.focus_row();
+        let col = self.focus_col();
+        if col == 0 {
+            return;
+        }
+        self.focus = self.focus_at(row, col - 1);
+    }
+
+    fn move_right(&mut self) {
+        let row = self.focus_row();
+        let col = self.focus_col();
+        let max_col = match row {
+            0 | 3 => 0,
+            1 | 2 => 2,
+            _ => 4,
+        };
+        if col >= max_col {
+            return;
+        }
+        self.focus = self.focus_at(row, col + 1);
+    }
+
+    fn delete_focused_atom(&mut self) {
+        let row = match self.focus.atom_row() {
+            Some(r) => r,
+            None => return,
+        };
+        if self.draft_atoms.is_empty() {
+            return;
+        }
+        let col = self.focus_col();
+        self.draft_atoms.remove(row);
+        if self.draft_atoms.is_empty() {
+            self.focus = EditorFocus::SpaceGroup;
+            self.atom_scroll = 0;
+        } else {
+            let new_row = row.min(self.draft_atoms.len() - 1);
+            self.focus = self.focus_at(4 + new_row, col);
+            self.ensure_atom_visible(new_row);
+        }
+    }
+
+    fn add_atom(&mut self) {
+        self.draft_atoms.push(DraftAtom {
+            label: format!("A{}", self.draft_atoms.len() + 1),
+            element: "X".to_string(),
+            x: "0.000000".to_string(),
+            y: "0.000000".to_string(),
+            z: "0.000000".to_string(),
+        });
+        let new_i = self.draft_atoms.len() - 1;
+        self.focus = EditorFocus::AtomLabel(new_i);
+        self.ensure_atom_visible(new_i);
+    }
+
+    fn build_structure(&self) -> Result<Structure, String> {
+        let a = self.draft_a.parse::<f32>().map_err(|_| "Invalid cell parameter a")?;
+        let b = self.draft_b.parse::<f32>().map_err(|_| "Invalid cell parameter b")?;
+        let c = self.draft_c.parse::<f32>().map_err(|_| "Invalid cell parameter c")?;
+        let alpha = self.draft_alpha.parse::<f32>().map_err(|_| "Invalid cell angle alpha")?;
+        let beta = self.draft_beta.parse::<f32>().map_err(|_| "Invalid cell angle beta")?;
+        let gamma = self.draft_gamma.parse::<f32>().map_err(|_| "Invalid cell angle gamma")?;
+
+        let cell = Cell::from_parameters(a, b, c, alpha, beta, gamma);
+
+        let asu_atoms: Vec<Atom> = self
+            .draft_atoms
+            .iter()
+            .filter_map(|da| da.to_atom())
+            .collect();
+
+        if asu_atoms.is_empty() {
+            return Err("No valid atoms defined".to_string());
+        }
+
+        let atoms = crate::cif::expand_asu_atoms(&asu_atoms, cell, &self.resolved_sg_ops);
+        let atoms = if atoms.is_empty() { asu_atoms.clone() } else { atoms };
+
+        let space_group = if self.draft_space_group.is_empty() {
+            None
+        } else {
+            Some(self.draft_space_group.clone())
+        };
+
+        Ok(Structure {
+            title: self.draft_title.clone(),
+            atoms,
+            cell,
+            space_group,
+            asu_atoms,
+            symmetry_ops: self.resolved_sg_ops.clone(),
+        })
+    }
+}
+
 fn is_cif_path(path: &Path) -> bool {
     path.extension()
         .and_then(|ext| ext.to_str())
@@ -308,6 +802,8 @@ fn empty_structure() -> Structure {
         atoms: Vec::new(),
         cell: None,
         space_group: None,
+        asu_atoms: Vec::new(),
+        symmetry_ops: Vec::new(),
     }
 }
 
@@ -349,6 +845,8 @@ pub struct App {
     show_xrd: bool,
     xrd_wavelength_idx: usize,
     cached_xrd_pattern: XrdPattern,
+    editor: Option<EditorState>,
+    current_cif_path: Option<PathBuf>,
 }
 
 impl App {
@@ -413,10 +911,18 @@ impl App {
             show_xrd: false,
             xrd_wavelength_idx,
             cached_xrd_pattern,
+            editor: None,
+            current_cif_path: None,
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
+        if self.editor.is_some() {
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                self.handle_editor_key(key);
+            }
+            return;
+        }
         if self.file_picker.is_some() {
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 self.handle_file_picker_key(key.code);
@@ -466,6 +972,8 @@ impl App {
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0),
             KeyCode::Char('B') => self.snap_view_to_lattice_axis(1),
             KeyCode::Char('C') => self.snap_view_to_lattice_axis(2),
+            KeyCode::Char('E') => self.open_editor_for_current(),
+            KeyCode::Char('F') => self.open_editor_new(),
             KeyCode::Tab => {
                 if !self.structure.atoms.is_empty() {
                     self.selected_atom = (self.selected_atom + 1) % self.structure.atoms.len();
@@ -507,6 +1015,7 @@ impl App {
 
         match crate::cif::parse_cif_file(&path) {
             Ok(structure) => {
+                self.current_cif_path = Some(path.clone());
                 self.apply_structure(structure);
                 if let Some(parent) = path.parent() {
                     self.open_dialog_dir = parent.to_path_buf();
@@ -870,6 +1379,251 @@ impl App {
             XRD_TWO_THETA_MAX,
         );
     }
+
+    fn open_editor_for_current(&mut self) {
+        if self.editor.is_some() {
+            self.editor = None;
+        } else {
+            self.editor = Some(EditorState::from_structure(
+                &self.structure,
+                self.current_cif_path.clone(),
+            ));
+        }
+    }
+
+    fn open_editor_new(&mut self) {
+        self.editor = Some(EditorState::new_empty());
+    }
+
+    fn editor_apply(&mut self) {
+        let result = if let Some(editor) = &self.editor {
+            editor.build_structure()
+        } else {
+            return;
+        };
+        match result {
+            Ok(structure) => {
+                let atom_count = structure.atoms.len();
+                self.apply_structure(structure);
+                if let Some(editor) = &mut self.editor {
+                    editor.status =
+                        Some(format!("Applied — {atom_count} atoms after expansion."));
+                }
+            }
+            Err(msg) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.status = Some(format!("Error: {msg}"));
+                }
+            }
+        }
+    }
+
+    fn editor_save(&mut self) {
+        let (structure, path) = match &self.editor {
+            Some(editor) => {
+                let s = match editor.build_structure() {
+                    Ok(s) => s,
+                    Err(msg) => {
+                        if let Some(editor) = &mut self.editor {
+                            editor.status = Some(format!("Error: {msg}"));
+                        }
+                        return;
+                    }
+                };
+                let p = editor.source_path.clone().unwrap_or_else(|| {
+                    PathBuf::from(format!("{}.cif", editor.draft_title))
+                });
+                (s, p)
+            }
+            None => return,
+        };
+        match crate::cif::write_cif(&structure, &path) {
+            Ok(()) => {
+                self.current_cif_path = Some(path.clone());
+                if let Some(editor) = &mut self.editor {
+                    editor.source_path = Some(path.clone());
+                    editor.status = Some(format!("Saved to {}", path.display()));
+                }
+            }
+            Err(err) => {
+                if let Some(editor) = &mut self.editor {
+                    editor.status = Some(format!("Save failed: {err}"));
+                }
+            }
+        }
+    }
+
+    fn handle_editor_key(&mut self, key: KeyEvent) {
+        // Ctrl+A / Ctrl+S are handled regardless of editing mode.
+        if key.modifiers.contains(KeyModifiers::CONTROL) {
+            match key.code {
+                KeyCode::Char('a') => {
+                    self.editor_apply();
+                    return;
+                }
+                KeyCode::Char('s') => {
+                    self.editor_save();
+                    return;
+                }
+                _ => {}
+            }
+        }
+
+        let editing = self.editor.as_ref().map(|e| e.editing).unwrap_or(false);
+
+        if editing {
+            self.handle_editor_edit_mode_key(key.code);
+        } else {
+            self.handle_editor_nav_mode_key(key.code);
+        }
+    }
+
+    fn handle_editor_nav_mode_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc | KeyCode::Char('E') => {
+                self.editor = None;
+            }
+            KeyCode::Enter => {
+                if let Some(editor) = &mut self.editor {
+                    editor.editing = true;
+                    let len = editor.get_field_text(editor.focus).len();
+                    editor.cursor_pos = len;
+                }
+            }
+            KeyCode::Tab => {
+                if let Some(editor) = &mut self.editor {
+                    let next = editor.next_focus();
+                    editor.focus = next;
+                    if let Some(atom_row) = editor.focus.atom_row() {
+                        editor.ensure_atom_visible(atom_row);
+                    }
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(editor) = &mut self.editor {
+                    let prev = editor.prev_focus();
+                    editor.focus = prev;
+                }
+            }
+            KeyCode::Up => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_up();
+                }
+            }
+            KeyCode::Down => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_down();
+                }
+            }
+            KeyCode::Left => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_left();
+                }
+            }
+            KeyCode::Right => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_right();
+                }
+            }
+            KeyCode::Char('a') | KeyCode::Char('A') => {
+                // Only 'A' (without Ctrl) in nav mode adds atom.
+                if let Some(editor) = &mut self.editor {
+                    editor.add_atom();
+                }
+            }
+            KeyCode::Char('d') | KeyCode::Char('D') | KeyCode::Delete => {
+                if let Some(editor) = &mut self.editor {
+                    editor.delete_focused_atom();
+                }
+            }
+            _ => {}
+        }
+    }
+
+    fn handle_editor_edit_mode_key(&mut self, code: KeyCode) {
+        match code {
+            KeyCode::Esc => {
+                if let Some(editor) = &mut self.editor {
+                    editor.editing = false;
+                }
+            }
+            KeyCode::Enter => {
+                // Commit value, exit edit mode.
+                if let Some(editor) = &mut self.editor {
+                    editor.editing = false;
+                }
+            }
+            KeyCode::Tab => {
+                // Commit + advance to next field (stay in edit mode).
+                if let Some(editor) = &mut self.editor {
+                    let next = editor.next_focus();
+                    editor.focus = next;
+                    if let Some(atom_row) = editor.focus.atom_row() {
+                        editor.ensure_atom_visible(atom_row);
+                    }
+                    let len = editor.get_field_text(next).len();
+                    editor.cursor_pos = len;
+                }
+            }
+            KeyCode::BackTab => {
+                if let Some(editor) = &mut self.editor {
+                    let prev = editor.prev_focus();
+                    editor.focus = prev;
+                    let len = editor.get_field_text(prev).len();
+                    editor.cursor_pos = len;
+                }
+            }
+            KeyCode::Backspace => {
+                if let Some(editor) = &mut self.editor {
+                    let focus = editor.focus;
+                    let mut text = editor.get_field_text(focus).to_string();
+                    if editor.cursor_pos > 0 && editor.cursor_pos <= text.len() {
+                        text.remove(editor.cursor_pos - 1);
+                        editor.cursor_pos -= 1;
+                        editor.set_field_text(focus, text);
+                    }
+                }
+            }
+            KeyCode::Char(ch) => {
+                if let Some(editor) = &mut self.editor {
+                    let focus = editor.focus;
+                    let mut text = editor.get_field_text(focus).to_string();
+                    let pos = editor.cursor_pos.min(text.len());
+                    text.insert(pos, ch);
+                    editor.cursor_pos = pos + 1;
+                    editor.set_field_text(focus, text);
+                }
+            }
+            KeyCode::Left => {
+                if let Some(editor) = &mut self.editor {
+                    editor.cursor_pos = editor.cursor_pos.saturating_sub(1);
+                }
+            }
+            KeyCode::Right => {
+                if let Some(editor) = &mut self.editor {
+                    let len = editor.get_field_text(editor.focus).len();
+                    if editor.cursor_pos < len {
+                        editor.cursor_pos += 1;
+                    }
+                }
+            }
+            KeyCode::Up => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_up();
+                    let len = editor.get_field_text(editor.focus).len();
+                    editor.cursor_pos = len;
+                }
+            }
+            KeyCode::Down => {
+                if let Some(editor) = &mut self.editor {
+                    editor.move_down();
+                    let len = editor.get_field_text(editor.focus).len();
+                    editor.cursor_pos = len;
+                }
+            }
+            _ => {}
+        }
+    }
 }
 
 pub fn run(
@@ -946,7 +1700,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Percentage(50), Constraint::Percentage(50)])
+        .constraints([Constraint::Length(17), Constraint::Min(8)])
         .split(root[1]);
 
     let viewport_block = Block::default()
@@ -986,6 +1740,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 
     if let Some(file_picker) = &app.file_picker {
         draw_file_picker(frame, file_picker);
+    }
+
+    if let Some(editor) = &app.editor {
+        draw_editor(frame, editor, root[0]);
     }
 }
 
@@ -1314,6 +2072,343 @@ fn draw_file_picker(frame: &mut ratatui::Frame, picker: &FilePickerState) {
     frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
 }
 
+fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect) {
+    let popup = bottom_right_rect(71, 20, viewport);
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(" Structure Editor ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let max_w = inner.width.saturating_sub(2) as usize;
+    let mut lines: Vec<Line<'static>> = Vec::new();
+
+    // Helper: render a labeled field with [ ] brackets, showing cursor if active.
+    let field_line = |label: &str,
+                      value: &str,
+                      is_focused: bool,
+                      is_editing: bool,
+                      cursor_pos: usize,
+                      field_w: usize|
+     -> Vec<Span<'static>> {
+        let label_style = Style::default().fg(Color::Cyan);
+        let mut spans: Vec<Span<'static>> = if label.is_empty() {
+            vec![]
+        } else {
+            vec![Span::styled(format!("{label}: "), label_style)]
+        };
+        let bracket_style = if is_focused {
+            Style::default().fg(Color::LightYellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let edit_bracket_style = if is_focused && is_editing {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            bracket_style
+        };
+        spans.push(Span::styled("[", edit_bracket_style));
+        let inner_w = field_w.saturating_sub(2);
+        if is_focused && is_editing {
+            let mut display = value.to_string();
+            let cursor = cursor_pos.min(display.len());
+            display.insert(cursor, '_');
+            // Elide from left so cursor remains visible at end.
+            let display = elide_from_left(&display, inner_w);
+            let padded = format!("{:<width$}", display, width = inner_w);
+            spans.push(Span::styled(
+                padded,
+                Style::default().fg(Color::Black).bg(Color::LightYellow),
+            ));
+        } else {
+            let display = elide_right(value, inner_w);
+            let padded = format!("{:<width$}", display, width = inner_w);
+            let style = if is_focused {
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD)
+            } else {
+                Style::default().fg(Color::Gray)
+            };
+            spans.push(Span::styled(padded, style));
+        }
+        spans.push(Span::styled("]", edit_bracket_style));
+        spans
+    };
+
+    // Title line.
+    {
+        let is_f = editor.focus == EditorFocus::Title;
+        let title_w = (max_w / 2).max(16);
+        let mut spans = field_line(
+            "Title",
+            &editor.draft_title,
+            is_f,
+            editor.editing,
+            editor.cursor_pos,
+            title_w,
+        );
+        lines.push(Line::from(spans.drain(..).collect::<Vec<_>>()));
+    }
+
+    lines.push(Line::default());
+    lines.push(Line::from(Span::styled(
+        "  CELL PARAMETERS",
+        Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+    )));
+
+    // Cell a/b/c on one line.
+    {
+        let fw = 12usize;
+        let is_a = editor.focus == EditorFocus::CellA;
+        let is_b = editor.focus == EditorFocus::CellB;
+        let is_c = editor.focus == EditorFocus::CellC;
+        let mut spans = vec![Span::styled(" a ", Style::default().fg(Color::Red))];
+        spans.extend(field_line(
+            "",
+            &editor.draft_a,
+            is_a,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("b ", Style::default().fg(Color::Green)));
+        spans.extend(field_line(
+            "",
+            &editor.draft_b,
+            is_b,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("c ", Style::default().fg(Color::Blue)));
+        spans.extend(field_line(
+            "",
+            &editor.draft_c,
+            is_c,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::styled(" Å", Style::default().fg(Color::DarkGray)));
+        lines.push(Line::from(spans));
+    }
+
+    // Cell alpha/beta/gamma on one line.
+    {
+        let fw = 12usize;
+        let is_al = editor.focus == EditorFocus::CellAlpha;
+        let is_be = editor.focus == EditorFocus::CellBeta;
+        let is_ga = editor.focus == EditorFocus::CellGamma;
+        let mut spans = vec![Span::styled(" α ", Style::default().fg(Color::LightRed))];
+        spans.extend(field_line(
+            "",
+            &editor.draft_alpha,
+            is_al,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("β ", Style::default().fg(Color::LightGreen)));
+        spans.extend(field_line(
+            "",
+            &editor.draft_beta,
+            is_be,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::raw("  "));
+        spans.push(Span::styled("γ ", Style::default().fg(Color::LightBlue)));
+        spans.extend(field_line(
+            "",
+            &editor.draft_gamma,
+            is_ga,
+            editor.editing,
+            editor.cursor_pos,
+            fw,
+        ));
+        spans.push(Span::styled(" °", Style::default().fg(Color::DarkGray)));
+        lines.push(Line::from(spans));
+    }
+
+    // Space group line.
+    {
+        let is_f = editor.focus == EditorFocus::SpaceGroup;
+        let mut spans =
+            vec![Span::styled(" Space group: ", Style::default().fg(Color::Cyan))];
+        spans.extend(field_line(
+            "",
+            &editor.draft_space_group,
+            is_f,
+            editor.editing,
+            editor.cursor_pos,
+            16,
+        ));
+        let sg_info = match &editor.resolved_sg_name {
+            Some(name) => format!("  → {} ({} ops)", name, editor.resolved_sg_ops.len()),
+            None => format!("  → {} ops (custom)", editor.resolved_sg_ops.len()),
+        };
+        spans.push(Span::styled(sg_info, Style::default().fg(Color::DarkGray)));
+        lines.push(Line::from(spans));
+    }
+
+    lines.push(Line::default());
+    {
+        let header = Line::from(vec![
+            Span::styled(
+                "  ASYMMETRIC UNIT",
+                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                "                               ",
+                Style::default(),
+            ),
+            Span::styled(
+                "[A] Add  [D] Del",
+                Style::default().fg(Color::DarkGray),
+            ),
+        ]);
+        lines.push(header);
+    }
+    lines.push(Line::from(Span::styled(
+        "   #   Label   Elem        x              y              z",
+        Style::default().fg(Color::DarkGray),
+    )));
+    lines.push(Line::from(Span::styled(
+        "  ─────────────────────────────────────────────────────────────",
+        Style::default().fg(Color::DarkGray),
+    )));
+
+    // Atom rows — show up to EDITOR_ATOM_ROWS rows with scroll indicators.
+    let scroll = editor.atom_scroll;
+    let end = (scroll + EDITOR_ATOM_ROWS).min(editor.draft_atoms.len());
+    let has_above = scroll > 0;
+    let has_below = end < editor.draft_atoms.len();
+    for i in scroll..end {
+        let atom = &editor.draft_atoms[i];
+        let is_selected = editor.focus.atom_row() == Some(i);
+        let marker = if is_selected { "▶" } else { " " };
+        let row_style = if is_selected {
+            Style::default().fg(Color::White)
+        } else {
+            Style::default().fg(Color::Gray)
+        };
+
+        let fw_label = 8usize;
+        let fw_elem = 6usize;
+        let fw_coord = 14usize;
+
+        let scroll_hint = if i == scroll && has_above {
+            "↑"
+        } else if i == end - 1 && has_below {
+            "↓"
+        } else {
+            " "
+        };
+        let num_style = if is_selected {
+            Style::default().fg(Color::LightYellow)
+        } else {
+            Style::default().fg(Color::DarkGray)
+        };
+        let mut spans = vec![
+            Span::styled(format!("{marker}{:>3}", i + 1), num_style),
+            Span::styled(scroll_hint, Style::default().fg(Color::Cyan)),
+            Span::raw(" "),
+        ];
+
+        let is_label = editor.focus == EditorFocus::AtomLabel(i);
+        let is_elem = editor.focus == EditorFocus::AtomElement(i);
+        let is_x = editor.focus == EditorFocus::AtomX(i);
+        let is_y = editor.focus == EditorFocus::AtomY(i);
+        let is_z = editor.focus == EditorFocus::AtomZ(i);
+
+        spans.extend(field_line("", &atom.label, is_label, editor.editing, editor.cursor_pos, fw_label));
+        spans.push(Span::raw(" "));
+        spans.extend(field_line("", &atom.element, is_elem, editor.editing, editor.cursor_pos, fw_elem));
+        spans.push(Span::raw(" "));
+        spans.extend(field_line("", &atom.x, is_x, editor.editing, editor.cursor_pos, fw_coord));
+        spans.push(Span::raw(" "));
+        spans.extend(field_line("", &atom.y, is_y, editor.editing, editor.cursor_pos, fw_coord));
+        spans.push(Span::raw(" "));
+        spans.extend(field_line("", &atom.z, is_z, editor.editing, editor.cursor_pos, fw_coord));
+
+        lines.push(Line::from(spans));
+        let _ = row_style; // suppress warning
+    }
+
+    if editor.draft_atoms.is_empty() {
+        lines.push(Line::from(Span::styled(
+            "  (no atoms — press A to add)",
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::default());
+
+    // Expanded atom count.
+    {
+        let expanded_count = if let Ok(s) = editor.build_structure() {
+            s.atoms.len()
+        } else {
+            0
+        };
+        let sg_note = editor
+            .resolved_sg_name
+            .as_deref()
+            .unwrap_or("custom ops");
+        lines.push(Line::from(Span::styled(
+            format!("  Expanded: {expanded_count} atoms ({sg_note} symmetry)"),
+            Style::default().fg(Color::DarkGray),
+        )));
+    }
+
+    lines.push(Line::from(vec![
+        Span::styled("[Enter]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::raw(" Edit  "),
+        Span::styled("[Tab]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::raw(" Next  "),
+        Span::styled("[^A]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::raw(" Apply  "),
+        Span::styled("[^S]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::raw(" Save  "),
+        Span::styled("[Esc]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::raw(" Close"),
+    ]));
+
+    if let Some(status) = &editor.status {
+        lines.push(Line::from(Span::styled(
+            format!("  Status: {}", elide_right(status, max_w.saturating_sub(10))),
+            Style::default().fg(Color::LightGreen),
+        )));
+    }
+
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
+fn bottom_right_rect(width: u16, height: u16, area: Rect) -> Rect {
+    let margin = 1u16;
+    let usable_w = area.width.saturating_sub(margin * 2).max(10);
+    let usable_h = area.height.saturating_sub(margin * 2).max(8);
+    let w = width.min(usable_w);
+    let h = height.min(usable_h);
+    Rect {
+        x: area.x + area.width.saturating_sub(w + margin),
+        y: area.y + area.height.saturating_sub(h + margin),
+        width: w,
+        height: h,
+    }
+}
+
 fn centered_rect_sized(width: u16, height: u16, area: Rect) -> Rect {
     let usable_width = area.width.saturating_sub(2).max(10);
     let usable_height = area.height.saturating_sub(2).max(8);
@@ -1606,6 +2701,9 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
             WAVELENGTH_PRESETS[app.xrd_wavelength_idx].0.to_string(),
             Color::LightCyan,
         ),
+        section_header("EDITOR"),
+        control_short_value_line("E", "Edit struct", String::new(), Color::Gray),
+        control_short_value_line("F", "New struct", String::new(), Color::Gray),
     ]
 }
 
@@ -2890,6 +3988,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         // Start from identity so the expected result is unambiguous.
@@ -2936,6 +4035,7 @@ mod tests {
             }],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         app.lock_fov_zoom = false;
@@ -2997,6 +4097,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
 
         let scene = build_scene(&structure, true, true, DEFAULT_BOND_MAX_DISTANCE);
@@ -3025,6 +4126,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
 
         let strict = build_scene(&structure, false, true, 2.0);
@@ -3059,6 +4161,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
 
         // With both image types off, the cross-boundary bond target is a
@@ -3099,6 +4202,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
 
         let without_boundary = build_scene(&structure, false, true, 2.2);
@@ -3149,6 +4253,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
 
@@ -3182,6 +4287,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         assert!(!app.cell_on_top);
@@ -3200,6 +4306,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         assert_eq!(app.render_theme, RenderTheme::Orbital);
@@ -3232,6 +4339,7 @@ mod tests {
             }],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         let initial = app.rot_mat;
@@ -3274,6 +4382,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         let initial = app.spin_speed;
@@ -3299,6 +4408,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         assert!(app.show_orientation_gizmo);
@@ -3317,6 +4427,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         assert!(app.show_labels);
@@ -3340,6 +4451,7 @@ mod tests {
             }],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         app.show_bonds = false;
@@ -3392,6 +4504,7 @@ mod tests {
             }],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
 
@@ -3429,6 +4542,7 @@ mod tests {
             atoms: vec![],
             cell: None,
             space_group: None,
+            ..Default::default()
         };
         let mut app = App::new(structure);
         app.rot_mat = mat_from_euler(0.0, 0.0, 0.2); // some non-iso rotation with roll
@@ -3478,6 +4592,7 @@ mod tests {
             ],
             cell: Some(cell),
             space_group: None,
+            ..Default::default()
         };
 
         let mut with_cell = App::new(structure.clone());

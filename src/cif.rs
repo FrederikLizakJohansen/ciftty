@@ -1,4 +1,5 @@
 use std::collections::HashSet;
+use std::fmt::Write as FmtWrite;
 use std::fs;
 use std::path::Path;
 
@@ -175,6 +176,21 @@ pub fn parse_cif_str(input: &str, fallback_title: &str) -> Result<Structure> {
     }
 
     let cell_model = cell.build_cell();
+
+    // Snapshot asymmetric unit atoms (fractional coordinates only).
+    let asu_atoms: Vec<Atom> = parsed_atoms
+        .iter()
+        .filter_map(|pa| match &pa.position {
+            ParsedPosition::Fractional(frac) => Some(Atom {
+                label: pa.label.clone(),
+                element: pa.element.clone(),
+                position: *frac, // store raw fractional as position temporarily
+                fractional: Some(*frac),
+            }),
+            ParsedPosition::Cartesian(_) => None,
+        })
+        .collect();
+
     let atoms = expand_atoms(parsed_atoms, cell_model, &symmetry_ops);
 
     if atoms.is_empty() {
@@ -186,6 +202,8 @@ pub fn parse_cif_str(input: &str, fallback_title: &str) -> Result<Structure> {
         atoms,
         cell: cell_model,
         space_group,
+        asu_atoms,
+        symmetry_ops,
     })
 }
 
@@ -289,6 +307,120 @@ fn expand_atoms(
     }
 
     atoms
+}
+
+/// Expand asymmetric unit `Atom` items through symmetry operations,
+/// deduplicate, and convert to Cartesian coordinates.
+pub(crate) fn expand_asu_atoms(asu: &[Atom], cell: Option<Cell>, ops: &[String]) -> Vec<Atom> {
+    let mut atoms = Vec::new();
+    let mut seen: HashSet<(String, i32, i32, i32)> = HashSet::new();
+    let has_ops = !ops.is_empty();
+
+    for atom in asu {
+        let frac = match atom.fractional {
+            Some(f) => f,
+            None => continue,
+        };
+        let mut generated = Vec::new();
+        if has_ops {
+            for op in ops {
+                if let Some(new_frac) = apply_symmetry_operation(op, frac) {
+                    generated.push(new_frac);
+                }
+            }
+        }
+        if generated.is_empty() {
+            generated.push(normalize_fractional(frac));
+        }
+        for frac_pos in generated {
+            let key = (
+                atom.element.clone(),
+                quantize_fractional(frac_pos[0]),
+                quantize_fractional(frac_pos[1]),
+                quantize_fractional(frac_pos[2]),
+            );
+            if !seen.insert(key) {
+                continue;
+            }
+            let position = if let Some(c) = cell {
+                c.frac_to_cart(frac_pos)
+            } else {
+                frac_pos
+            };
+            atoms.push(Atom {
+                label: atom.label.clone(),
+                element: atom.element.clone(),
+                position,
+                fractional: Some(frac_pos),
+            });
+        }
+    }
+    atoms
+}
+
+pub fn write_cif(structure: &crate::model::Structure, path: &Path) -> anyhow::Result<()> {
+    let mut out = String::new();
+
+    // data_ block name: sanitize title (no spaces)
+    let block_name: String = structure
+        .title
+        .chars()
+        .map(|c| if c.is_whitespace() { '_' } else { c })
+        .collect();
+    writeln!(out, "data_{block_name}").unwrap();
+    writeln!(out).unwrap();
+
+    if let Some(cell) = structure.cell {
+        writeln!(out, "_cell_length_a   {:.6}", cell.a).unwrap();
+        writeln!(out, "_cell_length_b   {:.6}", cell.b).unwrap();
+        writeln!(out, "_cell_length_c   {:.6}", cell.c).unwrap();
+        writeln!(out, "_cell_angle_alpha   {:.6}", cell.alpha_deg).unwrap();
+        writeln!(out, "_cell_angle_beta   {:.6}", cell.beta_deg).unwrap();
+        writeln!(out, "_cell_angle_gamma   {:.6}", cell.gamma_deg).unwrap();
+        writeln!(out).unwrap();
+    }
+
+    if let Some(sg) = &structure.space_group {
+        writeln!(out, "_symmetry_space_group_name_H-M   '{sg}'").unwrap();
+        writeln!(out).unwrap();
+    }
+
+    if !structure.symmetry_ops.is_empty() {
+        writeln!(out, "loop_").unwrap();
+        writeln!(out, " _symmetry_equiv_pos_site_id").unwrap();
+        writeln!(out, " _symmetry_equiv_pos_as_xyz").unwrap();
+        for (i, op) in structure.symmetry_ops.iter().enumerate() {
+            writeln!(out, "  {} '{op}'", i + 1).unwrap();
+        }
+        writeln!(out).unwrap();
+    }
+
+    // Use asu_atoms if available, otherwise fall back to atoms.
+    let write_atoms: &[Atom] = if !structure.asu_atoms.is_empty() {
+        &structure.asu_atoms
+    } else {
+        &structure.atoms
+    };
+
+    writeln!(out, "loop_").unwrap();
+    writeln!(out, " _atom_site_label").unwrap();
+    writeln!(out, " _atom_site_type_symbol").unwrap();
+    writeln!(out, " _atom_site_fract_x").unwrap();
+    writeln!(out, " _atom_site_fract_y").unwrap();
+    writeln!(out, " _atom_site_fract_z").unwrap();
+
+    for atom in write_atoms {
+        let frac = atom.fractional.unwrap_or(atom.position);
+        writeln!(
+            out,
+            "  {} {} {:.6} {:.6} {:.6}",
+            atom.label, atom.element, frac[0], frac[1], frac[2]
+        )
+        .unwrap();
+    }
+
+    fs::write(path, out).with_context(|| format!("Could not write CIF to {}", path.display()))?;
+    Ok(())
 }
 
 fn apply_symmetry_operation(operation: &str, frac: [f32; 3]) -> Option<[f32; 3]> {
