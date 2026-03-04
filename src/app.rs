@@ -19,6 +19,12 @@ use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
 
 use crate::model::{Cell, Structure};
+use crate::xrd::{XrdPattern, compute_pattern};
+
+const WAVELENGTH_PRESETS: &[(&str, f32)] =
+    &[("Cu Kα", 1.5406), ("Mo Kα", 0.7093), ("Co Kα", 1.7902), ("Ag Kα", 0.5594)];
+const XRD_TWO_THETA_MAX: f32 = 180.0;
+const XRD_PANEL_HEIGHT: u16 = 14;
 
 const ROTATION_STEP: f32 = 0.06;
 const ROLL_STEP: f32 = 0.06;
@@ -340,6 +346,9 @@ pub struct App {
     cached_formula: String,
     open_dialog_dir: PathBuf,
     file_picker: Option<FilePickerState>,
+    show_xrd: bool,
+    xrd_wavelength_idx: usize,
+    cached_xrd_pattern: XrdPattern,
 }
 
 impl App {
@@ -365,6 +374,12 @@ impl App {
         // Compute once — structure.atoms is immutable after construction.
         let cached_element_counts = element_counts(&structure.atoms);
         let cached_formula = empirical_formula(&cached_element_counts);
+        let xrd_wavelength_idx = 0usize;
+        let cached_xrd_pattern = compute_pattern(
+            &structure,
+            WAVELENGTH_PRESETS[xrd_wavelength_idx].1,
+            XRD_TWO_THETA_MAX,
+        );
         Self {
             structure,
             scene,
@@ -395,6 +410,9 @@ impl App {
             cached_formula,
             open_dialog_dir,
             file_picker: None,
+            show_xrd: false,
+            xrd_wavelength_idx,
+            cached_xrd_pattern,
         }
     }
 
@@ -443,6 +461,8 @@ impl App {
             KeyCode::Char('v') => self.toggle_orientation_gizmo(),
             KeyCode::Char('g') => self.toggle_render_theme(),
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
+            KeyCode::Char('X') => self.show_xrd = !self.show_xrd,
+            KeyCode::Char('W') => self.cycle_xrd_wavelength(),
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0),
             KeyCode::Char('B') => self.snap_view_to_lattice_axis(1),
             KeyCode::Char('C') => self.snap_view_to_lattice_axis(2),
@@ -835,6 +855,20 @@ impl App {
         self.rebuild_scene();
         self.cached_element_counts = element_counts(&self.structure.atoms);
         self.cached_formula = empirical_formula(&self.cached_element_counts);
+        self.cached_xrd_pattern = compute_pattern(
+            &self.structure,
+            WAVELENGTH_PRESETS[self.xrd_wavelength_idx].1,
+            XRD_TWO_THETA_MAX,
+        );
+    }
+
+    fn cycle_xrd_wavelength(&mut self) {
+        self.xrd_wavelength_idx = (self.xrd_wavelength_idx + 1) % WAVELENGTH_PRESETS.len();
+        self.cached_xrd_pattern = compute_pattern(
+            &self.structure,
+            WAVELENGTH_PRESETS[self.xrd_wavelength_idx].1,
+            XRD_TWO_THETA_MAX,
+        );
     }
 }
 
@@ -890,10 +924,25 @@ pub fn run(
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
+
+    // Optionally carve a horizontal XRD strip from the bottom.
+    let (top_area, xrd_area) = if app.show_xrd {
+        let rows = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Min(8),
+                Constraint::Length(XRD_PANEL_HEIGHT),
+            ])
+            .split(area);
+        (rows[0], Some(rows[1]))
+    } else {
+        (area, None)
+    };
+
     let root = Layout::default()
         .direction(Direction::Horizontal)
         .constraints([Constraint::Min(24), Constraint::Length(44)])
-        .split(area);
+        .split(top_area);
 
     let right = Layout::default()
         .direction(Direction::Vertical)
@@ -931,9 +980,230 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .wrap(Wrap { trim: true });
     frame.render_widget(view_panel, right[1]);
 
+    if let Some(xrd_rect) = xrd_area {
+        draw_xrd_panel(frame, app, xrd_rect);
+    }
+
     if let Some(file_picker) = &app.file_picker {
         draw_file_picker(frame, file_picker);
     }
+}
+
+fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
+    let pattern = &app.cached_xrd_pattern;
+    let (wl_name, _) = WAVELENGTH_PRESETS[app.xrd_wavelength_idx];
+    let title = format!(" XRD  {wl_name} {:.4}Å ", pattern.wavelength);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(title);
+    let inner = block.inner(area);
+    frame.render_widget(block, area);
+    if pattern.peaks.is_empty() {
+        let msg = if app.structure.cell.is_none() {
+            "No unit cell — XRD requires fractional coordinates"
+        } else {
+            "No diffraction peaks in range"
+        };
+        frame.render_widget(
+            Paragraph::new(Span::styled(msg, Style::default().fg(Color::DarkGray))),
+            inner,
+        );
+        return;
+    }
+
+    let inner_w = inner.width as usize;
+    let inner_h = inner.height as usize;
+    if inner_w < 20 || inner_h < 4 {
+        return;
+    }
+
+    // Layout (rows, top to bottom):
+    //   CHART_ROWS   stick bars with y-axis labels
+    //   1            baseline "     └──┴──────┴─── 2θ"
+    //   1            2θ tick labels
+    //   remaining    peak table
+    const CHART_ROWS: usize = 5;
+    const AXIS_ROWS: usize = 2;
+    let table_rows = inner_h.saturating_sub(CHART_ROWS + AXIS_ROWS);
+
+    // Left margin: "100% " (5 chars) + "│" (1 char) = 6 cols
+    const Y_LABEL_W: usize = 5;
+    const Y_SEP: usize = 1;
+    let plot_w = inner_w.saturating_sub(Y_LABEL_W + Y_SEP);
+    if plot_w == 0 {
+        return;
+    }
+
+    let theta_min = 5.0_f32;
+    let theta_max = XRD_TWO_THETA_MAX;
+    let theta_to_col = |t: f32| -> usize {
+        ((t - theta_min) / (theta_max - theta_min) * (plot_w as f32 - 1.0))
+            .round()
+            .clamp(0.0, (plot_w - 1) as f32) as usize
+    };
+
+    // Assign labels 1–5 to the 5 tallest peaks (by 2θ order among the top-5).
+    // All other peaks appear in the chart with ▲ (label = 0).
+    let mut top_indices: Vec<usize> = (0..pattern.peaks.len()).collect();
+    top_indices.sort_by(|&a, &b| {
+        pattern.peaks[b].intensity.partial_cmp(&pattern.peaks[a].intensity).unwrap()
+    });
+    top_indices.truncate(5);
+    top_indices.sort_by(|&a, &b| {
+        pattern.peaks[a].two_theta.partial_cmp(&pattern.peaks[b].two_theta).unwrap()
+    });
+    let mut peak_labels = vec![0usize; pattern.peaks.len()]; // 0 = ▲
+    for (lbl, &i) in top_indices.iter().enumerate() {
+        peak_labels[i] = lbl + 1;
+    }
+    let top_peaks: Vec<(usize, &crate::xrd::BraggPeak)> = top_indices
+        .iter()
+        .map(|&i| (peak_labels[i], &pattern.peaks[i]))
+        .collect();
+
+    // For each plot column, keep the highest-intensity peak that lands there.
+    let mut col_data: Vec<Option<(usize, f32)>> = vec![None; plot_w]; // (label 0=▲ or 1–5, intensity)
+    for (idx, peak) in pattern.peaks.iter().enumerate() {
+        let label = peak_labels[idx];
+        let col = theta_to_col(peak.two_theta);
+        match col_data[col] {
+            None => col_data[col] = Some((label, peak.intensity)),
+            Some((_, prev_i)) if peak.intensity > prev_i => {
+                col_data[col] = Some((label, peak.intensity));
+            }
+            _ => {}
+        }
+    }
+
+    let mut lines: Vec<Line<'static>> = Vec::with_capacity(inner_h);
+
+    // ── Stick chart rows ─────────────────────────────────────────────────────
+    for row in 0..CHART_ROWS {
+        let y_label = match row {
+            0 => "100% ",
+            r if r == CHART_ROWS / 2 => " 50% ",
+            r if r == CHART_ROWS - 1 => "  0% ",
+            _ => "     ",
+        };
+        let mut spans: Vec<Span<'static>> = vec![
+            Span::styled(y_label, Style::default().fg(Color::DarkGray)),
+            Span::styled("│", Style::default().fg(Color::DarkGray)),
+        ];
+
+        for col in 0..plot_w {
+            let (ch, color) = match col_data[col] {
+                None => (' ', Color::Reset),
+                Some((label, intensity)) => {
+                    // top_row: first row (from top) where the bar is drawn.
+                    // Clamped so even a 1% peak shows one row.
+                    let top_row =
+                        ((1.0 - intensity / 100.0) * CHART_ROWS as f32).floor() as usize;
+                    let top_row = top_row.min(CHART_ROWS - 1);
+                    let color = if intensity >= 50.0 {
+                        Color::LightCyan
+                    } else if intensity >= 15.0 {
+                        Color::Cyan
+                    } else {
+                        Color::DarkGray
+                    };
+                    let ch = if row < top_row {
+                        ' '
+                    } else if row == top_row {
+                        // Peak tip: numbered for top-5, ▲ for all others.
+                        if label > 0 {
+                            char::from_digit(label as u32, 10).unwrap_or('▲')
+                        } else {
+                            '▲'
+                        }
+                    } else {
+                        '│'
+                    };
+                    (ch, color)
+                }
+            };
+
+            if ch == ' ' {
+                spans.push(Span::raw(" "));
+            } else {
+                // Numbered tips are bold white; ▲ and bars use the peak's color.
+                let style = if ch.is_ascii_digit() {
+                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                } else {
+                    Style::default().fg(color)
+                };
+                spans.push(Span::styled(ch.to_string(), style));
+            }
+        }
+        lines.push(Line::from(spans));
+    }
+
+    // ── Baseline "     └──┴──────────────────────── 2θ" ────────────────────
+    {
+        let prefix = " ".repeat(Y_LABEL_W) + "└";
+        let ticks: String = (0..plot_w)
+            .map(|col| if col_data[col].is_some() { '┴' } else { '─' })
+            .collect();
+        let suffix = " 2θ";
+        let full = format!("{prefix}{ticks}{suffix}");
+        lines.push(Line::from(Span::styled(full, Style::default().fg(Color::DarkGray))));
+    }
+
+    // ── 2θ tick labels "      10°   20°   30°   40°   50°   60°   70°   80°" ─
+    {
+        let total = Y_LABEL_W + Y_SEP + plot_w;
+        let mut label_buf: Vec<u8> = vec![b' '; total];
+        for tick in (20u32..=160).step_by(20) {
+            let col = theta_to_col(tick as f32);
+            let label = format!("{tick}°");
+            let start = (Y_LABEL_W + Y_SEP + col).saturating_sub(label.len() / 2);
+            for (i, byte) in label.bytes().enumerate() {
+                let pos = start + i;
+                if pos < label_buf.len() {
+                    label_buf[pos] = byte;
+                }
+            }
+        }
+        let s = String::from_utf8_lossy(&label_buf).into_owned();
+        lines.push(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray))));
+    }
+
+    // ── Peak table ───────────────────────────────────────────────────────────
+    // The 5 tallest peaks, labeled 1–5 left-to-right, matching chart tips.
+    // Each row: "  N  44.7°  d=2.027Å  [ 1  1  0]  ██████████  100%"
+    let bar_cap = (inner_w.saturating_sub(32)).clamp(4, 24);
+    for &(label, peak) in top_peaks.iter().take(table_rows) {
+        let [h, k, l] = peak.hkl;
+        let bar_len = ((peak.intensity / 100.0) * bar_cap as f32).round() as usize;
+        let bar = "█".repeat(bar_len);
+        let bar_color = if peak.intensity >= 50.0 { Color::LightCyan } else { Color::Cyan };
+        lines.push(Line::from(vec![
+            Span::styled(
+                format!("{label:2} "),
+                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+            ),
+            Span::styled(
+                format!("{:5.1}°", peak.two_theta),
+                Style::default().fg(Color::LightYellow),
+            ),
+            Span::styled(
+                format!("  d={:.3}Å", peak.d_spacing),
+                Style::default().fg(Color::Gray),
+            ),
+            Span::styled(
+                format!("  [{:2} {:2} {:2}]", h, k, l),
+                Style::default().fg(Color::DarkGray),
+            ),
+            Span::styled("  ", Style::default()),
+            Span::styled(bar, Style::default().fg(bar_color)),
+            Span::styled(
+                format!("  {:.0}%", peak.intensity),
+                Style::default().fg(Color::White),
+            ),
+        ]));
+    }
+
+    frame.render_widget(Paragraph::new(lines), inner);
 }
 
 fn draw_file_picker(frame: &mut ratatui::Frame, picker: &FilePickerState) {
@@ -1327,6 +1597,14 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
             "Atom",
             format!("{}/{}", app.selected_atom + 1, app.structure.atoms.len()),
             Color::LightGreen,
+        ),
+        section_header("DIFFRACTION"),
+        control_short_bool_line("X", "XRD panel", app.show_xrd),
+        control_short_value_line(
+            "W",
+            "Source",
+            WAVELENGTH_PRESETS[app.xrd_wavelength_idx].0.to_string(),
+            Color::LightCyan,
         ),
     ]
 }

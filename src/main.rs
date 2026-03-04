@@ -1,6 +1,7 @@
 mod app;
 mod cif;
 mod model;
+mod xrd;
 
 use std::env;
 use std::io::stdout;
