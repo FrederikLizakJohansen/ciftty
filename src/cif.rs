@@ -600,15 +600,131 @@ loop_
 
     #[test]
     fn expands_symmetry_to_match_u3te4_multiplicity() {
-        let cif = include_str!("../data/U3Te4.cif");
-        let structure = parse_cif_str(cif, "u3te4_fixture").expect("U3Te4.cif should parse");
+        let cif = "data_U3Te4
+_symmetry_space_group_name_H-M   I-43d
+_cell_length_a   9.48509980
+_cell_length_b   9.48509980
+_cell_length_c   9.48509980
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   90.00000000
+_symmetry_Int_Tables_number   220
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+  2  'y+1/4, -x+3/4, -z+1/4'
+  3  '-x, -y+1/2, z'
+  4  '-y+3/4, x+3/4, -z+1/4'
+  5  'x, -y, -z+1/2'
+  6  'y+1/4, x+1/4, z+1/4'
+  7  '-x, y+1/2, -z+1/2'
+  8  '-y+3/4, -x+1/4, z+1/4'
+  9  'z, x, y'
+  10  '-z+1/4, y+1/4, -x+3/4'
+  11  'z, -x, -y+1/2'
+  12  '-z+1/4, -y+3/4, x+3/4'
+  13  '-z+1/2, x, -y'
+  14  'z+1/4, y+1/4, x+1/4'
+  15  '-z+1/2, -x, y+1/2'
+  16  'z+1/4, -y+3/4, -x+1/4'
+  17  'y, z, x'
+  18  '-x+3/4, -z+1/4, y+1/4'
+  19  '-y+1/2, z, -x'
+  20  'x+3/4, -z+1/4, -y+3/4'
+  21  '-y, -z+1/2, x'
+  22  'x+1/4, z+1/4, y+1/4'
+  23  'y+1/2, -z+1/2, -x'
+  24  '-x+1/4, z+1/4, -y+3/4'
+  25  'x+1/2, y+1/2, z+1/2'
+  26  'y+3/4, -x+1/4, -z+3/4'
+  27  '-x+1/2, -y, z+1/2'
+  28  '-y+1/4, x+1/4, -z+3/4'
+  29  'x+1/2, -y+1/2, -z'
+  30  'y+3/4, x+3/4, z+3/4'
+  31  '-x+1/2, y, -z'
+  32  '-y+1/4, -x+3/4, z+3/4'
+  33  'z+1/2, x+1/2, y+1/2'
+  34  '-z+3/4, y+3/4, -x+1/4'
+  35  'z+1/2, -x+1/2, -y'
+  36  '-z+3/4, -y+1/4, x+1/4'
+  37  '-z, x+1/2, -y+1/2'
+  38  'z+3/4, y+3/4, x+3/4'
+  39  '-z, -x+1/2, y'
+  40  'z+3/4, -y+1/4, -x+3/4'
+  41  'y+1/2, z+1/2, x+1/2'
+  42  '-x+1/4, -z+3/4, y+3/4'
+  43  '-y, z+1/2, -x+1/2'
+  44  'x+1/4, -z+3/4, -y+1/4'
+  45  '-y+1/2, -z, x+1/2'
+  46  'x+3/4, z+3/4, y+3/4'
+  47  'y, -z, -x+1/2'
+  48  '-x+3/4, z+3/4, -y+1/4'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  U  U0  12  0.00000000  0.25000000  0.37500000  1
+  Te  Te1  16  0.07670302  0.92329698  0.42329698  1
+";
+        let structure = parse_cif_str(cif, "u3te4_fixture").expect("U3Te4 should parse");
         assert_eq!(structure.atoms.len(), 28);
     }
 
     #[test]
     fn expands_symmetry_to_match_cega2_multiplicity() {
-        let cif = include_str!("../data/CeGa2.cif");
-        let structure = parse_cif_str(cif, "cega2_fixture").expect("CeGa2.cif should parse");
+        let cif = "data_CeGa2
+_symmetry_space_group_name_H-M   P6/mmm
+_cell_length_a   4.25068455
+_cell_length_b   4.25068455
+_cell_length_c   4.33876287
+_cell_angle_alpha   90.00000000
+_cell_angle_beta   90.00000000
+_cell_angle_gamma   120.00000000
+_symmetry_Int_Tables_number   191
+loop_
+ _symmetry_equiv_pos_site_id
+ _symmetry_equiv_pos_as_xyz
+  1  'x, y, z'
+  2  '-x, -y, -z'
+  3  'x-y, x, z'
+  4  '-x+y, -x, -z'
+  5  '-y, x-y, z'
+  6  'y, -x+y, -z'
+  7  '-x, -y, z'
+  8  'x, y, -z'
+  9  '-x+y, -x, z'
+  10  'x-y, x, -z'
+  11  'y, -x+y, z'
+  12  '-y, x-y, -z'
+  13  '-y, -x, -z'
+  14  'y, x, z'
+  15  '-x, -x+y, -z'
+  16  'x, x-y, z'
+  17  '-x+y, y, -z'
+  18  'x-y, -y, z'
+  19  'y, x, -z'
+  20  '-y, -x, z'
+  21  'x, x-y, -z'
+  22  '-x, -x+y, z'
+  23  'x-y, -y, -z'
+  24  '-x+y, y, z'
+loop_
+ _atom_site_type_symbol
+ _atom_site_label
+ _atom_site_symmetry_multiplicity
+ _atom_site_fract_x
+ _atom_site_fract_y
+ _atom_site_fract_z
+ _atom_site_occupancy
+  Ce  Ce0  1  0.00000000  0.00000000  0.00000000  1
+  Ga  Ga1  2  0.33333333  0.66666667  0.50000000  1
+";
+        let structure = parse_cif_str(cif, "cega2_fixture").expect("CeGa2 should parse");
         assert_eq!(structure.atoms.len(), 3);
     }
 }
