@@ -22,6 +22,9 @@ ciftty path/to/structure.cif
 
 # start without a file and use the built-in browser to open one
 ciftty
+
+# browse a sampled ensemble (optionally with a target CIF for ranking)
+ciftty ensemble path/to/samples_dir [path/to/target.cif]
 ```
 
 Press `Shift+O` at any time to open the CIF browser dialog.
@@ -66,6 +69,17 @@ Press `Shift+E` to edit the current structure, or `Shift+F` to start a new one.
 |-----|--------|
 | `Shift+X` | Toggle XRD panel |
 | `Shift+W` | Cycle X-ray source (`Cu Kα` / `Mo Kα` / `Co Kα` / `Ag Kα`) |
+| `Shift+Y` | Toggle target reference details (ensemble mode) |
+
+### Ensemble (when started with `ciftty ensemble ...`)
+| Key | Action |
+|-----|--------|
+| `↑` / `↓` | Previous / next sampled structure |
+| `PageUp` / `PageDown` | Jump 5 samples |
+| `Shift+P` | Cycle ranking mode (`target` / `novelty` / `name`) |
+| `Shift+G` | Toggle 3×3 ensemble grid view (up to 9 samples/page) |
+
+In ensemble mode, camera/display controls apply only to the focused sample.
 
 ### Editor
 | Key | Action |
@@ -110,6 +124,7 @@ Mouse drag rotates the view; scroll wheel zooms (`Ctrl+scroll` changes FOV).
 - Periodic boundary images and bonded outside-cell images
 - Orientation gizmo (RGB x/y/z axes)
 - Simulated powder XRD panel with wavelength presets and top-peak labels
+- Ensemble mode for browsing multiple sampled CIFs with target-distance ranking
 - Built-in structure editor for title, cell, space group, and asymmetric-unit atoms
 - Apply edits live and save back to CIF
 - Kitty keyboard protocol for smooth key-repeat

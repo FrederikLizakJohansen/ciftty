@@ -11,19 +11,23 @@ use crossterm::event::{
     self, Event, KeyCode, KeyEvent, KeyEventKind, KeyModifiers, MouseButton, MouseEvent,
     MouseEventKind,
 };
-use ratatui::Terminal;
 use ratatui::backend::CrosstermBackend;
 use ratatui::layout::{Constraint, Direction, Layout, Rect};
 use ratatui::style::{Color, Modifier, Style};
 use ratatui::text::{Line, Span, Text};
 use ratatui::widgets::{Block, BorderType, Borders, Clear, Padding, Paragraph, Wrap};
+use ratatui::Terminal;
 
 use crate::model::{Atom, Cell, Structure};
 use crate::spacegroup;
-use crate::xrd::{XrdPattern, compute_pattern};
+use crate::xrd::{compute_pattern, XrdPattern};
 
-const WAVELENGTH_PRESETS: &[(&str, f32)] =
-    &[("Cu Kα", 1.5406), ("Mo Kα", 0.7093), ("Co Kα", 1.7902), ("Ag Kα", 0.5594)];
+const WAVELENGTH_PRESETS: &[(&str, f32)] = &[
+    ("Cu Kα", 1.5406),
+    ("Mo Kα", 0.7093),
+    ("Co Kα", 1.7902),
+    ("Ag Kα", 0.5594),
+];
 const XRD_TWO_THETA_MAX: f32 = 180.0;
 const XRD_PANEL_HEIGHT: u16 = 14;
 
@@ -80,6 +84,9 @@ const MIN_SPIN_SPEED: f32 = 0.10;
 const MAX_SPIN_SPEED: f32 = 5.00;
 const SPIN_SPEED_STEP: f32 = 0.10;
 const SPIN_BASE_RATE_RAD_PER_SEC: f32 = 1.2;
+const ENSEMBLE_FP_BINS: usize = 720;
+const ENSEMBLE_GRID_CAPACITY: usize = 9;
+const ENSEMBLE_GRID_COLUMNS: usize = 3;
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum RenderTheme {
@@ -156,6 +163,212 @@ impl RenderTheme {
             Self::Neon => Color::LightYellow,
             Self::Wild => Color::LightRed,
             _ => BOND_LINE_COLOR,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct EnsembleInput {
+    pub source_dir: PathBuf,
+    pub samples: Vec<(PathBuf, Structure)>,
+    pub target: Option<(PathBuf, Structure)>,
+    pub skipped_files: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum EnsembleSortMode {
+    TargetDistance,
+    Novelty,
+    FileName,
+}
+
+impl EnsembleSortMode {
+    fn label(self) -> &'static str {
+        match self {
+            Self::TargetDistance => "target",
+            Self::Novelty => "novelty",
+            Self::FileName => "name",
+        }
+    }
+
+    fn next(self, has_target: bool) -> Self {
+        if has_target {
+            match self {
+                Self::TargetDistance => Self::Novelty,
+                Self::Novelty => Self::FileName,
+                Self::FileName => Self::TargetDistance,
+            }
+        } else {
+            match self {
+                Self::Novelty => Self::FileName,
+                Self::FileName | Self::TargetDistance => Self::Novelty,
+            }
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnsembleViewState {
+    rot_mat: [[f32; 3]; 3],
+    zoom: f32,
+    fov_deg: f32,
+    lock_fov_zoom: bool,
+    pan: [f32; 2],
+    sphere_scale: f32,
+    show_bonds: bool,
+    show_cell: bool,
+    cell_on_top: bool,
+    show_boundary_images: bool,
+    show_bonded_images: bool,
+    bond_max_distance: f32,
+    show_labels: bool,
+    show_orientation_gizmo: bool,
+    render_theme: RenderTheme,
+}
+
+#[derive(Debug, Clone)]
+struct EnsembleEntry {
+    path: PathBuf,
+    structure: Structure,
+    fingerprint: Vec<f32>,
+    distance_to_target: Option<f32>,
+    novelty: f32,
+    view_state: EnsembleViewState,
+}
+
+#[derive(Debug, Clone)]
+struct EnsembleState {
+    source_dir: PathBuf,
+    target_path: Option<PathBuf>,
+    target_pattern: Option<XrdPattern>,
+    target_fingerprint: Option<Vec<f32>>,
+    entries: Vec<EnsembleEntry>,
+    order: Vec<usize>,
+    selected_rank: usize,
+    sort_mode: EnsembleSortMode,
+    skipped_files: usize,
+}
+
+impl EnsembleState {
+    fn from_input(input: EnsembleInput, default_view_state: EnsembleViewState) -> Option<Self> {
+        if input.samples.is_empty() {
+            return None;
+        }
+
+        let (_, wavelength) = WAVELENGTH_PRESETS[0];
+        let target_path = input.target.as_ref().map(|(path, _)| path.clone());
+        let target_pattern = input
+            .target
+            .as_ref()
+            .map(|(_, structure)| compute_pattern(structure, wavelength, XRD_TWO_THETA_MAX));
+        let target_fingerprint = target_pattern
+            .as_ref()
+            .map(|pattern| xrd_pattern_fingerprint(pattern, ENSEMBLE_FP_BINS));
+
+        let mut entries: Vec<EnsembleEntry> = input
+            .samples
+            .into_iter()
+            .map(|(path, structure)| {
+                let pattern = compute_pattern(&structure, wavelength, XRD_TWO_THETA_MAX);
+                let fingerprint = xrd_pattern_fingerprint(&pattern, ENSEMBLE_FP_BINS);
+                let distance_to_target = target_fingerprint
+                    .as_ref()
+                    .map(|target_fp| cosine_distance(&fingerprint, target_fp));
+                EnsembleEntry {
+                    path,
+                    structure,
+                    fingerprint,
+                    distance_to_target,
+                    novelty: 0.0,
+                    view_state: default_view_state.clone(),
+                }
+            })
+            .collect();
+
+        compute_ensemble_novelty(&mut entries);
+
+        let sort_mode = if target_fingerprint.is_some() {
+            EnsembleSortMode::TargetDistance
+        } else {
+            EnsembleSortMode::Novelty
+        };
+        let mut state = Self {
+            source_dir: input.source_dir,
+            target_path,
+            target_pattern,
+            target_fingerprint,
+            entries,
+            order: Vec::new(),
+            selected_rank: 0,
+            sort_mode,
+            skipped_files: input.skipped_files,
+        };
+        state.refresh_order(None);
+        Some(state)
+    }
+
+    fn has_target(&self) -> bool {
+        self.target_fingerprint.is_some()
+    }
+
+    fn selected_entry_index(&self) -> Option<usize> {
+        self.order.get(self.selected_rank).copied()
+    }
+
+    fn selected_entry(&self) -> Option<&EnsembleEntry> {
+        self.selected_entry_index()
+            .and_then(|idx| self.entries.get(idx))
+    }
+
+    fn cycle_sort_mode(&mut self) {
+        let current_idx = self.selected_entry_index();
+        self.sort_mode = self.sort_mode.next(self.has_target());
+        self.refresh_order(current_idx);
+    }
+
+    fn select_offset(&mut self, delta: isize) -> Option<usize> {
+        if self.order.is_empty() {
+            return None;
+        }
+        let max_idx = self.order.len().saturating_sub(1) as isize;
+        let next = (self.selected_rank as isize + delta).clamp(0, max_idx) as usize;
+        self.selected_rank = next;
+        self.order.get(self.selected_rank).copied()
+    }
+
+    fn refresh_order(&mut self, selected_entry_idx: Option<usize>) {
+        self.order = (0..self.entries.len()).collect();
+        self.order.sort_by(|&lhs, &rhs| {
+            let left = &self.entries[lhs];
+            let right = &self.entries[rhs];
+            let by_metric = match self.sort_mode {
+                EnsembleSortMode::TargetDistance => left
+                    .distance_to_target
+                    .partial_cmp(&right.distance_to_target)
+                    .unwrap_or(Ordering::Equal),
+                EnsembleSortMode::Novelty => right
+                    .novelty
+                    .partial_cmp(&left.novelty)
+                    .unwrap_or(Ordering::Equal),
+                EnsembleSortMode::FileName => {
+                    file_name_key(&left.path).cmp(&file_name_key(&right.path))
+                }
+            };
+            by_metric.then_with(|| file_name_key(&left.path).cmp(&file_name_key(&right.path)))
+        });
+
+        let current_idx = selected_entry_idx.or_else(|| self.selected_entry_index());
+        self.selected_rank = current_idx
+            .and_then(|idx| self.order.iter().position(|&candidate| candidate == idx))
+            .unwrap_or(0);
+    }
+
+    fn store_view_state_for_selected(&mut self, view_state: &EnsembleViewState) {
+        let Some(selected_idx) = self.selected_entry_index() else {
+            return;
+        };
+        if let Some(entry) = self.entries.get_mut(selected_idx) {
+            entry.view_state = view_state.clone();
         }
     }
 }
@@ -427,11 +640,14 @@ impl EditorState {
             .unwrap_or_else(|| "P1".to_string());
 
         // Resolve via spacegroup lookup.
-        let (resolved_ops, resolved_name) =
-            Self::resolve_sg(&sg_str, &structure.symmetry_ops);
+        let (resolved_ops, resolved_name) = Self::resolve_sg(&sg_str, &structure.symmetry_ops);
 
         let draft_atoms = if !structure.asu_atoms.is_empty() {
-            structure.asu_atoms.iter().map(DraftAtom::from_atom).collect()
+            structure
+                .asu_atoms
+                .iter()
+                .map(DraftAtom::from_atom)
+                .collect()
         } else {
             structure.atoms.iter().map(DraftAtom::from_atom).collect()
         };
@@ -478,21 +694,19 @@ impl EditorState {
             EditorFocus::CellBeta => &self.draft_beta,
             EditorFocus::CellGamma => &self.draft_gamma,
             EditorFocus::SpaceGroup => &self.draft_space_group,
-            EditorFocus::AtomLabel(i) => {
-                self.draft_atoms.get(i).map(|a| a.label.as_str()).unwrap_or("")
-            }
-            EditorFocus::AtomElement(i) => {
-                self.draft_atoms.get(i).map(|a| a.element.as_str()).unwrap_or("")
-            }
-            EditorFocus::AtomX(i) => {
-                self.draft_atoms.get(i).map(|a| a.x.as_str()).unwrap_or("")
-            }
-            EditorFocus::AtomY(i) => {
-                self.draft_atoms.get(i).map(|a| a.y.as_str()).unwrap_or("")
-            }
-            EditorFocus::AtomZ(i) => {
-                self.draft_atoms.get(i).map(|a| a.z.as_str()).unwrap_or("")
-            }
+            EditorFocus::AtomLabel(i) => self
+                .draft_atoms
+                .get(i)
+                .map(|a| a.label.as_str())
+                .unwrap_or(""),
+            EditorFocus::AtomElement(i) => self
+                .draft_atoms
+                .get(i)
+                .map(|a| a.element.as_str())
+                .unwrap_or(""),
+            EditorFocus::AtomX(i) => self.draft_atoms.get(i).map(|a| a.x.as_str()).unwrap_or(""),
+            EditorFocus::AtomY(i) => self.draft_atoms.get(i).map(|a| a.y.as_str()).unwrap_or(""),
+            EditorFocus::AtomZ(i) => self.draft_atoms.get(i).map(|a| a.z.as_str()).unwrap_or(""),
         }
     }
 
@@ -746,12 +960,30 @@ impl EditorState {
     }
 
     fn build_structure(&self) -> Result<Structure, String> {
-        let a = self.draft_a.parse::<f32>().map_err(|_| "Invalid cell parameter a")?;
-        let b = self.draft_b.parse::<f32>().map_err(|_| "Invalid cell parameter b")?;
-        let c = self.draft_c.parse::<f32>().map_err(|_| "Invalid cell parameter c")?;
-        let alpha = self.draft_alpha.parse::<f32>().map_err(|_| "Invalid cell angle alpha")?;
-        let beta = self.draft_beta.parse::<f32>().map_err(|_| "Invalid cell angle beta")?;
-        let gamma = self.draft_gamma.parse::<f32>().map_err(|_| "Invalid cell angle gamma")?;
+        let a = self
+            .draft_a
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell parameter a")?;
+        let b = self
+            .draft_b
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell parameter b")?;
+        let c = self
+            .draft_c
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell parameter c")?;
+        let alpha = self
+            .draft_alpha
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell angle alpha")?;
+        let beta = self
+            .draft_beta
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell angle beta")?;
+        let gamma = self
+            .draft_gamma
+            .parse::<f32>()
+            .map_err(|_| "Invalid cell angle gamma")?;
 
         let cell = Cell::from_parameters(a, b, c, alpha, beta, gamma);
 
@@ -766,7 +998,11 @@ impl EditorState {
         }
 
         let atoms = crate::cif::expand_asu_atoms(&asu_atoms, cell, &self.resolved_sg_ops);
-        let atoms = if atoms.is_empty() { asu_atoms.clone() } else { atoms };
+        let atoms = if atoms.is_empty() {
+            asu_atoms.clone()
+        } else {
+            atoms
+        };
 
         let space_group = if self.draft_space_group.is_empty() {
             None
@@ -847,6 +1083,9 @@ pub struct App {
     cached_xrd_pattern: XrdPattern,
     editor: Option<EditorState>,
     current_cif_path: Option<PathBuf>,
+    ensemble: Option<EnsembleState>,
+    show_target_overlay: bool,
+    show_ensemble_grid: bool,
 }
 
 impl App {
@@ -913,6 +1152,9 @@ impl App {
             cached_xrd_pattern,
             editor: None,
             current_cif_path: None,
+            ensemble: None,
+            show_target_overlay: false,
+            show_ensemble_grid: false,
         }
     }
 
@@ -934,6 +1176,7 @@ impl App {
             KeyEventKind::Repeat => self.handle_key_repeat(key.code),
             KeyEventKind::Release => {}
         }
+        self.sync_current_view_into_selected_ensemble();
     }
 
     /// Actions that fire once per key-down (toggles, discrete steps).
@@ -947,6 +1190,18 @@ impl App {
             KeyCode::Char('R') => self.toggle_spin_lock(),
             KeyCode::Char('<') => self.adjust_spin_speed(-SPIN_SPEED_STEP),
             KeyCode::Char('>') => self.adjust_spin_speed(SPIN_SPEED_STEP),
+            KeyCode::Up => {
+                self.select_ensemble_relative(-1);
+            }
+            KeyCode::Down => {
+                self.select_ensemble_relative(1);
+            }
+            KeyCode::PageUp => {
+                self.select_ensemble_relative(-5);
+            }
+            KeyCode::PageDown => {
+                self.select_ensemble_relative(5);
+            }
             KeyCode::Char('+') | KeyCode::Char('=') => self.set_zoom(self.zoom * 1.1),
             KeyCode::Char('-') => self.set_zoom(self.zoom / 1.1),
             KeyCode::Char(',') => self.set_fov(self.fov_deg - 2.0),
@@ -969,6 +1224,9 @@ impl App {
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
             KeyCode::Char('X') => self.show_xrd = !self.show_xrd,
             KeyCode::Char('W') => self.cycle_xrd_wavelength(),
+            KeyCode::Char('P') => self.cycle_ensemble_sort_mode(),
+            KeyCode::Char('Y') => self.toggle_target_overlay(),
+            KeyCode::Char('G') => self.toggle_ensemble_grid(),
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0),
             KeyCode::Char('B') => self.snap_view_to_lattice_axis(1),
             KeyCode::Char('C') => self.snap_view_to_lattice_axis(2),
@@ -985,6 +1243,149 @@ impl App {
 
     fn open_file_picker(&mut self) {
         self.file_picker = Some(FilePickerState::new(self.open_dialog_dir.clone()));
+    }
+
+    fn attach_ensemble(&mut self, input: EnsembleInput) {
+        let ensemble_state = EnsembleState::from_input(input, self.current_ensemble_view_state());
+        self.ensemble = ensemble_state;
+        self.show_target_overlay = self
+            .ensemble
+            .as_ref()
+            .and_then(|ensemble| ensemble.target_pattern.as_ref())
+            .is_some();
+        self.show_ensemble_grid = self.ensemble.is_some();
+        self.select_ensemble_relative(0);
+    }
+
+    fn select_ensemble_relative(&mut self, delta: isize) {
+        let current_view_state = self.current_ensemble_view_state();
+        let selected_entry = if let Some(ensemble) = self.ensemble.as_mut() {
+            ensemble.store_view_state_for_selected(&current_view_state);
+            let idx = ensemble.select_offset(delta);
+            idx.and_then(|selected_idx| {
+                ensemble.entries.get(selected_idx).map(|entry| {
+                    (
+                        entry.path.clone(),
+                        entry.structure.clone(),
+                        entry.view_state.clone(),
+                    )
+                })
+            })
+        } else {
+            None
+        };
+        if let Some((path, structure, view_state)) = selected_entry {
+            self.current_cif_path = Some(path);
+            self.apply_structure(structure);
+            self.apply_ensemble_view_state(&view_state);
+        }
+    }
+
+    fn cycle_ensemble_sort_mode(&mut self) {
+        let current_view_state = self.current_ensemble_view_state();
+        let selected_entry = if let Some(ensemble) = self.ensemble.as_mut() {
+            ensemble.store_view_state_for_selected(&current_view_state);
+            ensemble.cycle_sort_mode();
+            ensemble.selected_entry().map(|entry| {
+                (
+                    entry.path.clone(),
+                    entry.structure.clone(),
+                    entry.view_state.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((path, structure, view_state)) = selected_entry {
+            self.current_cif_path = Some(path);
+            self.apply_structure(structure);
+            self.apply_ensemble_view_state(&view_state);
+        }
+    }
+
+    fn toggle_target_overlay(&mut self) {
+        if let Some(ensemble) = &self.ensemble {
+            if ensemble.target_pattern.is_some() {
+                self.show_target_overlay = !self.show_target_overlay;
+            }
+        }
+    }
+
+    fn toggle_ensemble_grid(&mut self) {
+        if self.ensemble.is_some() {
+            self.show_ensemble_grid = !self.show_ensemble_grid;
+        }
+    }
+
+    fn ensemble_grid_page_bounds(&self) -> Option<(usize, usize)> {
+        if !self.show_ensemble_grid {
+            return None;
+        }
+        let ensemble = self.ensemble.as_ref()?;
+        if ensemble.order.is_empty() {
+            return None;
+        }
+        let start = (ensemble.selected_rank / ENSEMBLE_GRID_CAPACITY) * ENSEMBLE_GRID_CAPACITY;
+        let end = (start + ENSEMBLE_GRID_CAPACITY).min(ensemble.order.len());
+        Some((start, end))
+    }
+
+    fn selected_ensemble_entry(&self) -> Option<&EnsembleEntry> {
+        self.ensemble
+            .as_ref()
+            .and_then(|ensemble| ensemble.selected_entry())
+    }
+
+    fn current_ensemble_view_state(&self) -> EnsembleViewState {
+        EnsembleViewState {
+            rot_mat: self.rot_mat,
+            zoom: self.zoom,
+            fov_deg: self.fov_deg,
+            lock_fov_zoom: self.lock_fov_zoom,
+            pan: self.pan,
+            sphere_scale: self.sphere_scale,
+            show_bonds: self.show_bonds,
+            show_cell: self.show_cell,
+            cell_on_top: self.cell_on_top,
+            show_boundary_images: self.show_boundary_images,
+            show_bonded_images: self.show_bonded_images,
+            bond_max_distance: self.bond_max_distance,
+            show_labels: self.show_labels,
+            show_orientation_gizmo: self.show_orientation_gizmo,
+            render_theme: self.render_theme,
+        }
+    }
+
+    fn apply_ensemble_view_state(&mut self, view_state: &EnsembleViewState) {
+        self.rot_mat = view_state.rot_mat;
+        self.zoom = view_state.zoom;
+        self.fov_deg = view_state.fov_deg;
+        self.lock_fov_zoom = view_state.lock_fov_zoom;
+        self.pan = view_state.pan;
+        self.sphere_scale = view_state.sphere_scale;
+        self.show_bonds = view_state.show_bonds;
+        self.show_cell = view_state.show_cell;
+        self.cell_on_top = view_state.cell_on_top;
+        self.show_boundary_images = view_state.show_boundary_images;
+        self.show_bonded_images = view_state.show_bonded_images;
+        self.bond_max_distance = view_state.bond_max_distance;
+        self.show_labels = view_state.show_labels;
+        self.show_orientation_gizmo = view_state.show_orientation_gizmo;
+        self.render_theme = view_state.render_theme;
+        self.rebuild_scene();
+    }
+
+    fn sync_current_view_into_selected_ensemble(&mut self) {
+        let view_state = self.current_ensemble_view_state();
+        if let Some(ensemble) = self.ensemble.as_mut() {
+            ensemble.store_view_state_for_selected(&view_state);
+        }
+    }
+
+    fn clear_ensemble_mode(&mut self) {
+        self.ensemble = None;
+        self.show_target_overlay = false;
+        self.show_ensemble_grid = false;
     }
 
     fn handle_file_picker_key(&mut self, code: KeyCode) {
@@ -1015,6 +1416,7 @@ impl App {
 
         match crate::cif::parse_cif_file(&path) {
             Ok(structure) => {
+                self.clear_ensemble_mode();
                 self.current_cif_path = Some(path.clone());
                 self.apply_structure(structure);
                 if let Some(parent) = path.parent() {
@@ -1033,6 +1435,17 @@ impl App {
     fn handle_key_repeat(&mut self, code: KeyCode) {
         if self.spin_lock && self.set_spin_direction_from_key(code) {
             return;
+        }
+        match code {
+            KeyCode::Up => {
+                self.select_ensemble_relative(-1);
+                return;
+            }
+            KeyCode::Down => {
+                self.select_ensemble_relative(1);
+                return;
+            }
+            _ => {}
         }
         self.apply_continuous_key(code);
     }
@@ -1171,6 +1584,7 @@ impl App {
         self.rot_mat = mat_mul_3x3(mat_rot_x(vx * step), self.rot_mat);
         self.rot_mat = mat_mul_3x3(mat_rot_y(vy * step), self.rot_mat);
         self.rot_mat = mat_mul_3x3(mat_rot_z(vz * step), self.rot_mat);
+        self.sync_current_view_into_selected_ensemble();
     }
 
     fn adjust_bond_max_distance(&mut self, delta: f32) {
@@ -1228,7 +1642,11 @@ impl App {
             }
         }
 
-        if saw_point { Some(max_extent) } else { None }
+        if saw_point {
+            Some(max_extent)
+        } else {
+            None
+        }
     }
 
     fn solve_zoom_for_extent(
@@ -1337,6 +1755,7 @@ impl App {
             MouseEventKind::ScrollDown => self.handle_scroll_wheel(false, mouse.modifiers),
             _ => {}
         }
+        self.sync_current_view_into_selected_ensemble();
     }
 
     fn handle_scroll_wheel(&mut self, scroll_up: bool, modifiers: KeyModifiers) {
@@ -1404,10 +1823,10 @@ impl App {
         match result {
             Ok(structure) => {
                 let atom_count = structure.atoms.len();
+                self.clear_ensemble_mode();
                 self.apply_structure(structure);
                 if let Some(editor) = &mut self.editor {
-                    editor.status =
-                        Some(format!("Applied — {atom_count} atoms after expansion."));
+                    editor.status = Some(format!("Applied — {atom_count} atoms after expansion."));
                 }
             }
             Err(msg) => {
@@ -1430,9 +1849,10 @@ impl App {
                         return;
                     }
                 };
-                let p = editor.source_path.clone().unwrap_or_else(|| {
-                    PathBuf::from(format!("{}.cif", editor.draft_title))
-                });
+                let p = editor
+                    .source_path
+                    .clone()
+                    .unwrap_or_else(|| PathBuf::from(format!("{}.cif", editor.draft_title)));
                 (s, p)
             }
             None => return,
@@ -1630,6 +2050,7 @@ pub fn run(
     terminal: &mut Terminal<CrosstermBackend<Stdout>>,
     structure: Option<Structure>,
     open_dialog_dir: PathBuf,
+    ensemble: Option<EnsembleInput>,
 ) -> Result<()> {
     let mut app = if let Some(structure) = structure {
         let mut app = App::new(structure);
@@ -1638,6 +2059,9 @@ pub fn run(
     } else {
         App::with_initial_structure(None, open_dialog_dir)
     };
+    if let Some(ensemble_input) = ensemble {
+        app.attach_ensemble(ensemble_input);
+    }
     let tick_rate = Duration::from_millis(16);
     let mut previous_frame_time = std::time::Instant::now();
 
@@ -1683,10 +2107,7 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
     let (top_area, xrd_area) = if app.show_xrd {
         let rows = Layout::default()
             .direction(Direction::Vertical)
-            .constraints([
-                Constraint::Min(8),
-                Constraint::Length(XRD_PANEL_HEIGHT),
-            ])
+            .constraints([Constraint::Min(8), Constraint::Length(XRD_PANEL_HEIGHT)])
             .split(area);
         (rows[0], Some(rows[1]))
     } else {
@@ -1698,17 +2119,21 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
         .constraints([Constraint::Min(24), Constraint::Length(44)])
         .split(top_area);
 
+    let structure_panel_height = if app.ensemble.is_some() { 24 } else { 17 };
     let right = Layout::default()
         .direction(Direction::Vertical)
-        .constraints([Constraint::Length(17), Constraint::Min(8)])
+        .constraints([
+            Constraint::Length(structure_panel_height),
+            Constraint::Min(8),
+        ])
         .split(root[1]);
 
     let viewport_block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::new(1, 1, 0, 0))
-        .title("3D View");
+        .title(viewport_title(app));
     let viewport_inner = viewport_block.inner(root[0]);
-    let viewport = render_viewport_text(
+    let viewport = render_primary_viewport_text(
         app,
         viewport_inner.width as usize,
         viewport_inner.height as usize,
@@ -1750,7 +2175,17 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     let pattern = &app.cached_xrd_pattern;
     let (wl_name, _) = WAVELENGTH_PRESETS[app.xrd_wavelength_idx];
-    let title = format!(" XRD  {wl_name} {:.4}Å ", pattern.wavelength);
+    let target_distance = app
+        .selected_ensemble_entry()
+        .and_then(|entry| entry.distance_to_target);
+    let title = if let Some(distance) = target_distance {
+        format!(
+            " XRD  {wl_name} {:.4}Å  dXRD(Cu)={distance:.4} ",
+            pattern.wavelength
+        )
+    } else {
+        format!(" XRD  {wl_name} {:.4}Å ", pattern.wavelength)
+    };
     let block = Block::default()
         .borders(Borders::ALL)
         .padding(Padding::new(1, 1, 0, 0))
@@ -1805,11 +2240,17 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     // All other peaks appear in the chart with ▲ (label = 0).
     let mut top_indices: Vec<usize> = (0..pattern.peaks.len()).collect();
     top_indices.sort_by(|&a, &b| {
-        pattern.peaks[b].intensity.partial_cmp(&pattern.peaks[a].intensity).unwrap()
+        pattern.peaks[b]
+            .intensity
+            .partial_cmp(&pattern.peaks[a].intensity)
+            .unwrap()
     });
     top_indices.truncate(5);
     top_indices.sort_by(|&a, &b| {
-        pattern.peaks[a].two_theta.partial_cmp(&pattern.peaks[b].two_theta).unwrap()
+        pattern.peaks[a]
+            .two_theta
+            .partial_cmp(&pattern.peaks[b].two_theta)
+            .unwrap()
     });
     let mut peak_labels = vec![0usize; pattern.peaks.len()]; // 0 = ▲
     for (lbl, &i) in top_indices.iter().enumerate() {
@@ -1855,8 +2296,7 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
                 Some((label, intensity)) => {
                     // top_row: first row (from top) where the bar is drawn.
                     // Clamped so even a 1% peak shows one row.
-                    let top_row =
-                        ((1.0 - intensity / 100.0) * CHART_ROWS as f32).floor() as usize;
+                    let top_row = ((1.0 - intensity / 100.0) * CHART_ROWS as f32).floor() as usize;
                     let top_row = top_row.min(CHART_ROWS - 1);
                     let color = if intensity >= 50.0 {
                         Color::LightCyan
@@ -1886,7 +2326,9 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             } else {
                 // Numbered tips are bold white; ▲ and bars use the peak's color.
                 let style = if ch.is_ascii_digit() {
-                    Style::default().fg(Color::White).add_modifier(Modifier::BOLD)
+                    Style::default()
+                        .fg(Color::White)
+                        .add_modifier(Modifier::BOLD)
                 } else {
                     Style::default().fg(color)
                 };
@@ -1900,11 +2342,20 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     {
         let prefix = " ".repeat(Y_LABEL_W) + "└";
         let ticks: String = (0..plot_w)
-            .map(|col| if col_data[col].is_some() { '┴' } else { '─' })
+            .map(|col| {
+                if col_data[col].is_some() {
+                    '┴'
+                } else {
+                    '─'
+                }
+            })
             .collect();
         let suffix = " 2θ";
         let full = format!("{prefix}{ticks}{suffix}");
-        lines.push(Line::from(Span::styled(full, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            full,
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     // ── 2θ tick labels "      10°   20°   30°   40°   50°   60°   70°   80°" ─
@@ -1923,22 +2374,97 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
             }
         }
         let s = String::from_utf8_lossy(&label_buf).into_owned();
-        lines.push(Line::from(Span::styled(s, Style::default().fg(Color::DarkGray))));
+        lines.push(Line::from(Span::styled(
+            s,
+            Style::default().fg(Color::DarkGray),
+        )));
     }
 
     // ── Peak table ───────────────────────────────────────────────────────────
+    let mut used_table_rows = 0usize;
+    if table_rows > 0 {
+        if let Some(ensemble) = &app.ensemble {
+            if ensemble.has_target() {
+                let target_name = ensemble
+                    .target_path
+                    .as_ref()
+                    .and_then(|path| path.file_name())
+                    .and_then(|name| name.to_str())
+                    .unwrap_or("target.cif");
+                let state = if app.show_target_overlay { "on" } else { "off" };
+                let distance_text = target_distance
+                    .map(|distance| format!("  dXRD(Cu)={distance:.4}"))
+                    .unwrap_or_default();
+                lines.push(Line::from(vec![
+                    Span::styled("target ", Style::default().fg(Color::LightMagenta)),
+                    Span::styled(
+                        elide_right(target_name, 20),
+                        Style::default().fg(Color::White),
+                    ),
+                    Span::styled("  [Y] ", Style::default().fg(Color::DarkGray)),
+                    Span::styled(state, Style::default().fg(Color::LightYellow)),
+                    Span::styled(distance_text, Style::default().fg(Color::LightCyan)),
+                ]));
+                used_table_rows += 1;
+
+                if app.show_target_overlay && table_rows > used_table_rows {
+                    if let Some(target_pattern) = &ensemble.target_pattern {
+                        let mut strongest = target_pattern.peaks.clone();
+                        strongest.sort_by(|a, b| {
+                            b.intensity
+                                .partial_cmp(&a.intensity)
+                                .unwrap_or(Ordering::Equal)
+                        });
+                        strongest.truncate(3);
+                        strongest.sort_by(|a, b| {
+                            a.two_theta
+                                .partial_cmp(&b.two_theta)
+                                .unwrap_or(Ordering::Equal)
+                        });
+                        let summary = strongest
+                            .iter()
+                            .map(|peak| format!("{:.1}°", peak.two_theta))
+                            .collect::<Vec<_>>()
+                            .join("  ");
+                        lines.push(Line::from(vec![
+                            Span::styled("peaks ", Style::default().fg(Color::LightMagenta)),
+                            Span::styled(
+                                if summary.is_empty() {
+                                    "-".to_string()
+                                } else {
+                                    summary
+                                },
+                                Style::default().fg(Color::White),
+                            ),
+                        ]));
+                        used_table_rows += 1;
+                    }
+                }
+            }
+        }
+    }
+
     // The 5 tallest peaks, labeled 1–5 left-to-right, matching chart tips.
     // Each row: "  N  44.7°  d=2.027Å  [ 1  1  0]  ██████████  100%"
     let bar_cap = (inner_w.saturating_sub(32)).clamp(4, 24);
-    for &(label, peak) in top_peaks.iter().take(table_rows) {
+    for &(label, peak) in top_peaks
+        .iter()
+        .take(table_rows.saturating_sub(used_table_rows))
+    {
         let [h, k, l] = peak.hkl;
         let bar_len = ((peak.intensity / 100.0) * bar_cap as f32).round() as usize;
         let bar = "█".repeat(bar_len);
-        let bar_color = if peak.intensity >= 50.0 { Color::LightCyan } else { Color::Cyan };
+        let bar_color = if peak.intensity >= 50.0 {
+            Color::LightCyan
+        } else {
+            Color::Cyan
+        };
         lines.push(Line::from(vec![
             Span::styled(
                 format!("{label:2} "),
-                Style::default().fg(Color::White).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::White)
+                    .add_modifier(Modifier::BOLD),
             ),
             Span::styled(
                 format!("{:5.1}°", peak.two_theta),
@@ -2160,7 +2686,9 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
     lines.push(Line::default());
     lines.push(Line::from(Span::styled(
         "  CELL PARAMETERS",
-        Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+        Style::default()
+            .fg(Color::Gray)
+            .add_modifier(Modifier::BOLD),
     )));
 
     // Cell a/b/c on one line.
@@ -2244,8 +2772,10 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
     // Space group line.
     {
         let is_f = editor.focus == EditorFocus::SpaceGroup;
-        let mut spans =
-            vec![Span::styled(" Space group: ", Style::default().fg(Color::Cyan))];
+        let mut spans = vec![Span::styled(
+            " Space group: ",
+            Style::default().fg(Color::Cyan),
+        )];
         spans.extend(field_line(
             "",
             &editor.draft_space_group,
@@ -2267,16 +2797,12 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
         let header = Line::from(vec![
             Span::styled(
                 "  ASYMMETRIC UNIT",
-                Style::default().fg(Color::Gray).add_modifier(Modifier::BOLD),
+                Style::default()
+                    .fg(Color::Gray)
+                    .add_modifier(Modifier::BOLD),
             ),
-            Span::styled(
-                "                               ",
-                Style::default(),
-            ),
-            Span::styled(
-                "[A] Add  [D] Del",
-                Style::default().fg(Color::DarkGray),
-            ),
+            Span::styled("                               ", Style::default()),
+            Span::styled("[A] Add  [D] Del", Style::default().fg(Color::DarkGray)),
         ]);
         lines.push(header);
     }
@@ -2332,15 +2858,50 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
         let is_y = editor.focus == EditorFocus::AtomY(i);
         let is_z = editor.focus == EditorFocus::AtomZ(i);
 
-        spans.extend(field_line("", &atom.label, is_label, editor.editing, editor.cursor_pos, fw_label));
+        spans.extend(field_line(
+            "",
+            &atom.label,
+            is_label,
+            editor.editing,
+            editor.cursor_pos,
+            fw_label,
+        ));
         spans.push(Span::raw(" "));
-        spans.extend(field_line("", &atom.element, is_elem, editor.editing, editor.cursor_pos, fw_elem));
+        spans.extend(field_line(
+            "",
+            &atom.element,
+            is_elem,
+            editor.editing,
+            editor.cursor_pos,
+            fw_elem,
+        ));
         spans.push(Span::raw(" "));
-        spans.extend(field_line("", &atom.x, is_x, editor.editing, editor.cursor_pos, fw_coord));
+        spans.extend(field_line(
+            "",
+            &atom.x,
+            is_x,
+            editor.editing,
+            editor.cursor_pos,
+            fw_coord,
+        ));
         spans.push(Span::raw(" "));
-        spans.extend(field_line("", &atom.y, is_y, editor.editing, editor.cursor_pos, fw_coord));
+        spans.extend(field_line(
+            "",
+            &atom.y,
+            is_y,
+            editor.editing,
+            editor.cursor_pos,
+            fw_coord,
+        ));
         spans.push(Span::raw(" "));
-        spans.extend(field_line("", &atom.z, is_z, editor.editing, editor.cursor_pos, fw_coord));
+        spans.extend(field_line(
+            "",
+            &atom.z,
+            is_z,
+            editor.editing,
+            editor.cursor_pos,
+            fw_coord,
+        ));
 
         lines.push(Line::from(spans));
         let _ = row_style; // suppress warning
@@ -2362,10 +2923,7 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
         } else {
             0
         };
-        let sg_note = editor
-            .resolved_sg_name
-            .as_deref()
-            .unwrap_or("custom ops");
+        let sg_note = editor.resolved_sg_name.as_deref().unwrap_or("custom ops");
         lines.push(Line::from(Span::styled(
             format!("  Expanded: {expanded_count} atoms ({sg_note} symmetry)"),
             Style::default().fg(Color::DarkGray),
@@ -2373,21 +2931,39 @@ fn draw_editor(frame: &mut ratatui::Frame, editor: &EditorState, viewport: Rect)
     }
 
     lines.push(Line::from(vec![
-        Span::styled("[Enter]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::styled(
+            "[Enter]",
+            Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+        ),
         Span::raw(" Edit  "),
-        Span::styled("[Tab]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::styled(
+            "[Tab]",
+            Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+        ),
         Span::raw(" Next  "),
-        Span::styled("[^A]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::styled(
+            "[^A]",
+            Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+        ),
         Span::raw(" Apply  "),
-        Span::styled("[^S]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::styled(
+            "[^S]",
+            Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+        ),
         Span::raw(" Save  "),
-        Span::styled("[Esc]", Style::default().fg(Color::LightYellow).bg(Color::DarkGray)),
+        Span::styled(
+            "[Esc]",
+            Style::default().fg(Color::LightYellow).bg(Color::DarkGray),
+        ),
         Span::raw(" Close"),
     ]));
 
     if let Some(status) = &editor.status {
         lines.push(Line::from(Span::styled(
-            format!("  Status: {}", elide_right(status, max_w.saturating_sub(10))),
+            format!(
+                "  Status: {}",
+                elide_right(status, max_w.saturating_sub(10))
+            ),
             Style::default().fg(Color::LightGreen),
         )));
     }
@@ -2465,6 +3041,90 @@ fn elide_from_left(text: &str, max_chars: usize) -> String {
     format!("...{tail}")
 }
 
+fn xrd_pattern_fingerprint(pattern: &XrdPattern, bins: usize) -> Vec<f32> {
+    if bins == 0 {
+        return Vec::new();
+    }
+    let theta_min = 0.0_f32;
+    let theta_span = (XRD_TWO_THETA_MAX - theta_min).max(f32::EPSILON);
+    let mut fingerprint = vec![0.0_f32; bins];
+
+    for peak in &pattern.peaks {
+        if peak.two_theta < theta_min || peak.two_theta > XRD_TWO_THETA_MAX {
+            continue;
+        }
+        let ratio = (peak.two_theta - theta_min) / theta_span;
+        let col = (ratio * (bins.saturating_sub(1) as f32))
+            .round()
+            .clamp(0.0, bins.saturating_sub(1) as f32) as usize;
+        fingerprint[col] += peak.intensity.max(0.0);
+    }
+
+    let norm_sq: f32 = fingerprint.iter().map(|value| value * value).sum();
+    if norm_sq <= f32::EPSILON {
+        return fingerprint;
+    }
+    let norm = norm_sq.sqrt();
+    for value in &mut fingerprint {
+        *value /= norm;
+    }
+    fingerprint
+}
+
+fn cosine_distance(lhs: &[f32], rhs: &[f32]) -> f32 {
+    let lhs_norm_sq: f32 = lhs.iter().map(|value| value * value).sum();
+    let rhs_norm_sq: f32 = rhs.iter().map(|value| value * value).sum();
+    let lhs_nonzero = lhs_norm_sq > f32::EPSILON;
+    let rhs_nonzero = rhs_norm_sq > f32::EPSILON;
+    match (lhs_nonzero, rhs_nonzero) {
+        (false, false) => return 0.0,
+        (false, true) | (true, false) => return 1.0,
+        (true, true) => {}
+    }
+
+    let dot = lhs
+        .iter()
+        .zip(rhs.iter())
+        .map(|(left, right)| left * right)
+        .sum::<f32>();
+    let sim = dot / (lhs_norm_sq.sqrt() * rhs_norm_sq.sqrt());
+    (1.0 - sim).clamp(0.0, 2.0)
+}
+
+fn compute_ensemble_novelty(entries: &mut [EnsembleEntry]) {
+    if entries.is_empty() {
+        return;
+    }
+    if entries.len() == 1 {
+        entries[0].novelty = 0.0;
+        return;
+    }
+
+    let fingerprints: Vec<Vec<f32>> = entries
+        .iter()
+        .map(|entry| entry.fingerprint.clone())
+        .collect();
+    let count = entries.len();
+
+    for idx in 0..count {
+        let mut sum = 0.0_f32;
+        for other_idx in 0..count {
+            if idx == other_idx {
+                continue;
+            }
+            sum += cosine_distance(&fingerprints[idx], &fingerprints[other_idx]);
+        }
+        entries[idx].novelty = sum / (count as f32 - 1.0);
+    }
+}
+
+fn file_name_key(path: &Path) -> String {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| name.to_ascii_lowercase())
+        .unwrap_or_else(|| path.to_string_lossy().to_ascii_lowercase())
+}
+
 fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
     let selected = app.structure.atoms.get(app.selected_atom);
     let total_atoms = app.structure.atoms.len();
@@ -2489,9 +3149,72 @@ fn structure_panel_lines(app: &App) -> Vec<Line<'static>> {
             Color::LightBlue,
         ),
         elements_line(element_counts),
-        Line::default(),
-        section_header("LATTICE"),
     ];
+
+    if let Some(ensemble) = &app.ensemble {
+        lines.push(Line::default());
+        lines.push(section_header("ENSEMBLE"));
+        lines.push(kv_line(
+            "Source",
+            elide_from_left(&ensemble.source_dir.to_string_lossy(), 34),
+            Color::Cyan,
+            Color::Gray,
+        ));
+        lines.push(kv_line(
+            "Sample",
+            format!(
+                "{}/{}",
+                ensemble.selected_rank.saturating_add(1),
+                ensemble.order.len()
+            ),
+            Color::Cyan,
+            Color::LightGreen,
+        ));
+        lines.push(kv_line(
+            "Sort",
+            ensemble.sort_mode.label().to_string(),
+            Color::Cyan,
+            Color::LightMagenta,
+        ));
+        if let Some(entry) = ensemble.selected_entry() {
+            let sample_name = entry
+                .path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or("unknown");
+            lines.push(kv_line(
+                "File",
+                elide_right(sample_name, 30),
+                Color::Cyan,
+                Color::White,
+            ));
+            lines.push(kv_line(
+                "Novelty",
+                format!("{:.4}", entry.novelty),
+                Color::Cyan,
+                Color::LightBlue,
+            ));
+            if let Some(distance) = entry.distance_to_target {
+                lines.push(kv_line(
+                    "dXRD(Cu)",
+                    format!("{distance:.4}"),
+                    Color::Cyan,
+                    Color::LightYellow,
+                ));
+            }
+        }
+        if ensemble.skipped_files > 0 {
+            lines.push(kv_line(
+                "Skipped",
+                ensemble.skipped_files.to_string(),
+                Color::Cyan,
+                Color::LightRed,
+            ));
+        }
+    }
+
+    lines.push(Line::default());
+    lines.push(section_header("LATTICE"));
 
     if let Some(cell) = app.structure.cell {
         lines.push(Line::from(vec![
@@ -2602,6 +3325,11 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
         (true, false) => Color::LightYellow,
         (false, _) => Color::LightRed,
     };
+    let has_target = app
+        .ensemble
+        .as_ref()
+        .and_then(|ensemble| ensemble.target_pattern.as_ref())
+        .is_some();
 
     vec![
         section_header("VIEW"),
@@ -2700,6 +3428,16 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
             "Source",
             WAVELENGTH_PRESETS[app.xrd_wavelength_idx].0.to_string(),
             Color::LightCyan,
+        ),
+        control_short_bool_line("Y", "Target ref", app.show_target_overlay && has_target),
+        section_header("ENSEMBLE"),
+        control_short_value_line("↑↓", "Sample", String::new(), Color::Gray),
+        control_short_value_line("Pg↑↓", "Sample ±5", String::new(), Color::Gray),
+        control_short_value_line("P", "Cycle sort", String::new(), Color::Gray),
+        control_short_bool_line(
+            "G",
+            "Grid view",
+            app.show_ensemble_grid && app.ensemble.is_some(),
         ),
         section_header("EDITOR"),
         control_short_value_line("E", "Edit struct", String::new(), Color::Gray),
@@ -2860,7 +3598,11 @@ fn empirical_formula(counts: &BTreeMap<String, usize>) -> String {
             out.push_str(&n.to_string());
         }
     }
-    if out.is_empty() { "-".to_string() } else { out }
+    if out.is_empty() {
+        "-".to_string()
+    } else {
+        out
+    }
 }
 
 fn cell_volume(cell: Cell) -> f32 {
@@ -2873,6 +3615,251 @@ fn cell_volume(cell: Cell) -> f32 {
         b[0] * c[1] - b[1] * c[0],
     ];
     (a[0] * cross_bc[0] + a[1] * cross_bc[1] + a[2] * cross_bc[2]).abs()
+}
+
+fn viewport_title(app: &App) -> String {
+    if let Some((start, end)) = app.ensemble_grid_page_bounds() {
+        if let Some(ensemble) = &app.ensemble {
+            return format!(
+                "3D View · Ensemble Grid {}-{} / {}",
+                start + 1,
+                end,
+                ensemble.order.len()
+            );
+        }
+    }
+    "3D View".to_string()
+}
+
+fn render_primary_viewport_text(app: &App, width: usize, height: usize) -> Text<'static> {
+    if let Some(grid_text) = render_ensemble_grid_text(app, width, height) {
+        return grid_text;
+    }
+    render_viewport_text(app, width, height)
+}
+
+fn render_ensemble_grid_text(app: &App, width: usize, height: usize) -> Option<Text<'static>> {
+    if width == 0 || height == 0 {
+        return Some(Text::default());
+    }
+    let ensemble = app.ensemble.as_ref()?;
+    let (start, end) = app.ensemble_grid_page_bounds()?;
+    let visible = &ensemble.order[start..end];
+    let count = visible.len();
+    if count == 0 {
+        return None;
+    }
+
+    let columns = ENSEMBLE_GRID_COLUMNS.min(count.max(1));
+    let rows = (count + columns - 1) / columns;
+    let separator_cols = columns.saturating_sub(1);
+    let separator_rows = rows.saturating_sub(1);
+    if width <= separator_cols || height <= separator_rows {
+        return None;
+    }
+    let tile_w = (width - separator_cols) / columns;
+    let tile_h = (height - separator_rows) / rows;
+    if tile_w < 12 || tile_h < 6 {
+        return None;
+    }
+
+    let mut chars = vec![' '; width * height];
+    let mut colors = vec![Color::Reset; width * height];
+
+    for col_idx in 1..columns {
+        let col = col_idx * tile_w + (col_idx - 1);
+        if col >= width {
+            continue;
+        }
+        for row in 0..height {
+            let idx = row * width + col;
+            chars[idx] = '│';
+            colors[idx] = Color::DarkGray;
+        }
+    }
+    for row_idx in 1..rows {
+        let row = row_idx * tile_h + (row_idx - 1);
+        if row >= height {
+            continue;
+        }
+        for col in 0..width {
+            let idx = row * width + col;
+            chars[idx] = '─';
+            colors[idx] = Color::DarkGray;
+        }
+    }
+
+    let selected_entry_idx = ensemble.selected_entry_index();
+    for (slot_idx, &entry_idx) in visible.iter().enumerate() {
+        let row_idx = slot_idx / columns;
+        let col_idx = slot_idx % columns;
+        let x0 = col_idx * (tile_w + 1);
+        let y0 = row_idx * (tile_h + 1);
+        if x0 + tile_w > width || y0 + tile_h > height {
+            continue;
+        }
+
+        let entry = &ensemble.entries[entry_idx];
+        let view = &entry.view_state;
+        let scene = build_scene(
+            &entry.structure,
+            view.show_boundary_images,
+            view.show_bonded_images,
+            view.bond_max_distance,
+        );
+        let base_scale = bounding_sphere_scale(&scene);
+        let tile_buffer = render_viewport_buffer_with_config(
+            &ViewportRenderConfig {
+                structure: &entry.structure,
+                scene: &scene,
+                base_scale,
+                rot_mat: view.rot_mat,
+                zoom: view.zoom,
+                fov_deg: view.fov_deg,
+                pan: view.pan,
+                sphere_scale: view.sphere_scale,
+                show_bonds: view.show_bonds,
+                show_cell: view.show_cell,
+                cell_on_top: view.cell_on_top,
+                show_labels: false,
+                show_orientation_gizmo: false,
+                render_theme: view.render_theme,
+                selected_atom: None,
+                empty_hint: "",
+            },
+            tile_w,
+            tile_h,
+        );
+        blit_viewport_buffer(
+            &tile_buffer,
+            &mut chars,
+            &mut colors,
+            width,
+            x0,
+            y0,
+            tile_w,
+            tile_h,
+        );
+
+        let is_selected_tile = selected_entry_idx == Some(entry_idx);
+        if is_selected_tile {
+            draw_buffer_rect_border(
+                &mut chars,
+                &mut colors,
+                width,
+                height,
+                x0,
+                y0,
+                tile_w,
+                tile_h,
+                Color::LightYellow,
+            );
+        }
+
+        let sample_name = entry
+            .path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("unknown.cif");
+        let rank = start + slot_idx + 1;
+        let mut tile_label = format!("{rank}: {}", sample_name);
+        if let Some(distance) = entry.distance_to_target {
+            tile_label.push_str(&format!("  d={distance:.3}"));
+        }
+        tile_label = elide_right(&tile_label, tile_w.saturating_sub(2));
+        let label_color = if is_selected_tile {
+            Color::LightYellow
+        } else {
+            Color::Gray
+        };
+        let label_start_col = x0 + usize::from(is_selected_tile);
+        let max_label_width = tile_w.saturating_sub(label_start_col.saturating_sub(x0));
+        for (offset, ch) in tile_label.chars().enumerate() {
+            if offset >= max_label_width {
+                break;
+            }
+            put_buffer_char(
+                &mut chars,
+                &mut colors,
+                width,
+                height,
+                label_start_col + offset,
+                y0,
+                ch,
+                label_color,
+            );
+        }
+    }
+
+    Some(to_colored_text(&chars, &colors, width, height))
+}
+
+fn blit_viewport_buffer(
+    tile: &ViewportBuffer,
+    chars: &mut [char],
+    colors: &mut [Color],
+    target_width: usize,
+    x0: usize,
+    y0: usize,
+    tile_w: usize,
+    tile_h: usize,
+) {
+    for row in 0..tile_h {
+        for col in 0..tile_w {
+            let src_idx = row * tile_w + col;
+            let dst_idx = (y0 + row) * target_width + (x0 + col);
+            chars[dst_idx] = tile.chars[src_idx];
+            colors[dst_idx] = tile.colors[src_idx];
+        }
+    }
+}
+
+fn draw_buffer_rect_border(
+    chars: &mut [char],
+    colors: &mut [Color],
+    width: usize,
+    height: usize,
+    x0: usize,
+    y0: usize,
+    rect_w: usize,
+    rect_h: usize,
+    color: Color,
+) {
+    if rect_w < 2 || rect_h < 2 {
+        return;
+    }
+    let x1 = x0 + rect_w - 1;
+    let y1 = y0 + rect_h - 1;
+    for col in x0..=x1 {
+        put_buffer_char(chars, colors, width, height, col, y0, '─', color);
+        put_buffer_char(chars, colors, width, height, col, y1, '─', color);
+    }
+    for row in y0..=y1 {
+        put_buffer_char(chars, colors, width, height, x0, row, '│', color);
+        put_buffer_char(chars, colors, width, height, x1, row, '│', color);
+    }
+    put_buffer_char(chars, colors, width, height, x0, y0, '┌', color);
+    put_buffer_char(chars, colors, width, height, x1, y0, '┐', color);
+    put_buffer_char(chars, colors, width, height, x0, y1, '└', color);
+    put_buffer_char(chars, colors, width, height, x1, y1, '┘', color);
+}
+
+fn put_buffer_char(
+    chars: &mut [char],
+    colors: &mut [Color],
+    width: usize,
+    height: usize,
+    col: usize,
+    row: usize,
+    ch: char,
+    color: Color,
+) {
+    if col >= width || row >= height {
+        return;
+    }
+    let idx = row * width + col;
+    chars[idx] = ch;
+    colors[idx] = color;
 }
 
 #[cfg(test)]
@@ -2889,6 +3876,25 @@ fn render_viewport_text(app: &App, width: usize, height: usize) -> Text<'static>
 struct ViewportBuffer {
     chars: Vec<char>,
     colors: Vec<Color>,
+}
+
+struct ViewportRenderConfig<'a> {
+    structure: &'a Structure,
+    scene: &'a SceneGeometry,
+    base_scale: f32,
+    rot_mat: [[f32; 3]; 3],
+    zoom: f32,
+    fov_deg: f32,
+    pan: [f32; 2],
+    sphere_scale: f32,
+    show_bonds: bool,
+    show_cell: bool,
+    cell_on_top: bool,
+    show_labels: bool,
+    show_orientation_gizmo: bool,
+    render_theme: RenderTheme,
+    selected_atom: Option<usize>,
+    empty_hint: &'a str,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -3025,14 +4031,43 @@ impl CameraParams {
 }
 
 fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuffer {
+    render_viewport_buffer_with_config(
+        &ViewportRenderConfig {
+            structure: &app.structure,
+            scene: &app.scene,
+            base_scale: app.base_scale,
+            rot_mat: app.rot_mat,
+            zoom: app.zoom,
+            fov_deg: app.fov_deg,
+            pan: app.pan,
+            sphere_scale: app.sphere_scale,
+            show_bonds: app.show_bonds,
+            show_cell: app.show_cell,
+            cell_on_top: app.cell_on_top,
+            show_labels: app.show_labels,
+            show_orientation_gizmo: app.show_orientation_gizmo,
+            render_theme: app.render_theme,
+            selected_atom: Some(app.selected_atom),
+            empty_hint: EMPTY_VIEW_HINT,
+        },
+        width,
+        height,
+    )
+}
+
+fn render_viewport_buffer_with_config(
+    config: &ViewportRenderConfig<'_>,
+    width: usize,
+    height: usize,
+) -> ViewportBuffer {
     if width == 0 || height == 0 {
         return ViewportBuffer {
             chars: Vec::new(),
             colors: Vec::new(),
         };
     }
-    if app.scene.atoms.is_empty() {
-        let message = EMPTY_VIEW_HINT;
+    if config.scene.atoms.is_empty() {
+        let message = config.empty_hint;
         let mut chars = vec![' '; width * height];
         let mut colors = vec![Color::Reset; width * height];
         let row = height / 2;
@@ -3053,15 +4088,21 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
     let mut chars = vec![' '; width * height];
     let mut colors = vec![Color::Reset; width * height];
     let mut z_buffer = vec![f32::INFINITY; width * height];
-    let scale = app.base_scale * app.zoom;
+    let scale = config.base_scale * config.zoom;
     let Some(viewport) = ViewportTransform::for_size(width, height) else {
         return ViewportBuffer { chars, colors };
     };
     // Build camera params once — avoids recomputing trig values per point.
-    let camera = CameraParams::from_mat(app.scene.center, scale, app.rot_mat, app.fov_deg, app.pan);
+    let camera = CameraParams::from_mat(
+        config.scene.center,
+        scale,
+        config.rot_mat,
+        config.fov_deg,
+        config.pan,
+    );
 
-    if app.show_cell && !app.cell_on_top {
-        for (start, end) in &app.scene.cell_edges {
+    if config.show_cell && !config.cell_on_top {
+        for (start, end) in &config.scene.cell_edges {
             rasterize_segment(
                 &mut chars,
                 &mut colors,
@@ -3071,8 +4112,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 viewport,
                 *start,
                 *end,
-                app.render_theme.cell_line_glyph(),
-                app.render_theme.cell_line_color(),
+                config.render_theme.cell_line_glyph(),
+                config.render_theme.cell_line_color(),
                 &camera,
                 CELL_LINE_DEPTH_BIAS,
                 false,
@@ -3080,8 +4121,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         }
     }
 
-    if app.show_bonds {
-        for bond in &app.scene.bonds {
+    if config.show_bonds {
+        for bond in &config.scene.bonds {
             rasterize_segment(
                 &mut chars,
                 &mut colors,
@@ -3091,8 +4132,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 viewport,
                 bond.start,
                 bond.end,
-                app.render_theme.bond_line_glyph(),
-                app.render_theme.bond_line_color(),
+                config.render_theme.bond_line_glyph(),
+                config.render_theme.bond_line_color(),
                 &camera,
                 BOND_LINE_DEPTH_BIAS,
                 false,
@@ -3102,7 +4143,7 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
 
     // Rasterize atoms as sphere disks, back-to-front so the z-buffer correctly
     // resolves overlaps even at equal depth (painter's order as tie-breaker).
-    let mut atoms_projected: Vec<(&RenderAtom, ProjectedPoint)> = app
+    let mut atoms_projected: Vec<(&RenderAtom, ProjectedPoint)> = config
         .scene
         .atoms
         .iter()
@@ -3116,13 +4157,13 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         if !p.x.is_finite() || !p.y.is_finite() || !p.screen_scale.is_finite() {
             continue;
         }
-        let element = app
+        let element = config
             .structure
             .atoms
             .get(atom.base_index)
             .map(|a| a.element.as_str())
             .unwrap_or("X");
-        let r_world = display_radius(element) * app.sphere_scale;
+        let r_world = display_radius(element) * config.sphere_scale;
         // Projected radius in column units (x screen axis).
         let r_depth = r_world * scale;
         let r_screen = (r_depth * p.screen_scale * viewport.units_to_cols).max(0.5);
@@ -3147,7 +4188,10 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
             continue;
         }
 
-        let selected = atom.base_index == app.selected_atom && !atom.is_image;
+        let selected = config
+            .selected_atom
+            .map(|selected_atom| atom.base_index == selected_atom && !atom.is_image)
+            .unwrap_or(false);
         let color = atom_color(element, selected);
 
         for row in row0..=row1 {
@@ -3172,24 +4216,26 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                     continue;
                 }
                 z_buffer[idx] = z_pixel;
-                chars[idx] = sphere_glyph(nx, ny, nz, selected, app.render_theme);
+                chars[idx] = sphere_glyph(nx, ny, nz, selected, config.render_theme);
                 colors[idx] = color;
             }
         }
     }
 
-    if app.show_labels {
-        if let Some(selected) = app.structure.atoms.get(app.selected_atom) {
-            let label = format!("Selected: {} ({})", selected.label, selected.element);
-            for (i, ch) in label.chars().enumerate().take(width) {
-                chars[i] = ch;
-                colors[i] = LABEL_COLOR;
+    if config.show_labels {
+        if let Some(selected_atom) = config.selected_atom {
+            if let Some(selected) = config.structure.atoms.get(selected_atom) {
+                let label = format!("Selected: {} ({})", selected.label, selected.element);
+                for (i, ch) in label.chars().enumerate().take(width) {
+                    chars[i] = ch;
+                    colors[i] = LABEL_COLOR;
+                }
             }
         }
     }
 
-    if app.show_cell && app.cell_on_top {
-        for (start, end) in &app.scene.cell_edges {
+    if config.show_cell && config.cell_on_top {
+        for (start, end) in &config.scene.cell_edges {
             rasterize_segment(
                 &mut chars,
                 &mut colors,
@@ -3199,8 +4245,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
                 viewport,
                 *start,
                 *end,
-                app.render_theme.cell_line_glyph(),
-                app.render_theme.cell_line_color(),
+                config.render_theme.cell_line_glyph(),
+                config.render_theme.cell_line_color(),
                 &camera,
                 CELL_LINE_DEPTH_BIAS,
                 true,
@@ -3208,8 +4254,8 @@ fn render_viewport_buffer(app: &App, width: usize, height: usize) -> ViewportBuf
         }
     }
 
-    if app.show_orientation_gizmo {
-        draw_orientation_gizmo(&mut chars, &mut colors, width, height, app.rot_mat);
+    if config.show_orientation_gizmo {
+        draw_orientation_gizmo(&mut chars, &mut colors, width, height, config.rot_mat);
     }
 
     ViewportBuffer { chars, colors }
@@ -3898,10 +4944,10 @@ fn mat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        App, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MAX_SPIN_SPEED,
-        MIN_FOV_DEG, MIN_SPIN_SPEED, MOUSE_SENSITIVITY, RenderTheme, ViewportTransform,
         best_image_shift_and_distance, boundary_axis_shifts, build_scene, mat_from_euler,
-        project_world, render_viewport,
+        project_world, render_viewport, App, RenderTheme, ViewportTransform, CHAR_ASPECT,
+        DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MAX_SPIN_SPEED, MIN_FOV_DEG, MIN_SPIN_SPEED,
+        MOUSE_SENSITIVITY,
     };
     use crate::cif::parse_cif_str;
     use crate::model::{Atom, Cell, Structure};
@@ -4824,6 +5870,47 @@ mod tests {
             (scale - 0.92).abs() < 1e-5,
             "expected scale ≈ 0.92, got {scale}"
         );
+    }
+
+    #[test]
+    fn cosine_distance_handles_zero_and_orthogonal_vectors() {
+        use super::cosine_distance;
+
+        assert_eq!(cosine_distance(&[0.0, 0.0], &[0.0, 0.0]), 0.0);
+        assert_eq!(cosine_distance(&[1.0, 0.0], &[0.0, 0.0]), 1.0);
+        assert!((cosine_distance(&[1.0, 0.0], &[1.0, 0.0]) - 0.0).abs() < 1e-6);
+        assert!((cosine_distance(&[1.0, 0.0], &[0.0, 1.0]) - 1.0).abs() < 1e-6);
+    }
+
+    #[test]
+    fn xrd_pattern_fingerprint_is_l2_normalized() {
+        use super::{xrd_pattern_fingerprint, XrdPattern};
+        use crate::xrd::BraggPeak;
+
+        let pattern = XrdPattern {
+            peaks: vec![
+                BraggPeak {
+                    hkl: [1, 0, 0],
+                    two_theta: 20.0,
+                    d_spacing: 2.0,
+                    intensity: 30.0,
+                },
+                BraggPeak {
+                    hkl: [1, 1, 0],
+                    two_theta: 40.0,
+                    d_spacing: 1.4,
+                    intensity: 40.0,
+                },
+            ],
+            wavelength: 1.5406,
+        };
+        let fingerprint = xrd_pattern_fingerprint(&pattern, 360);
+        let norm = fingerprint
+            .iter()
+            .map(|value| value * value)
+            .sum::<f32>()
+            .sqrt();
+        assert!((norm - 1.0).abs() < 1e-5);
     }
 
     #[test]
