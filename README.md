@@ -3,7 +3,7 @@
 `ciftty` is a terminal CIF crystal structure viewer and editor written in Rust.
 
 Renders atomic structures as shaded ASCII spheres with bonds, periodic images,
-and a unit-cell wireframe. It can also simulate powder XRD patterns and edit/save
+and a unit-cell wireframe. It can also simulate XRD patterns and edit/save
 structures directly in the TUI.
 
 ## Install
