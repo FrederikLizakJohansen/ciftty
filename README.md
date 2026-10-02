@@ -63,6 +63,7 @@ Press `Shift+E` to edit the current structure, or `Shift+F` to start a new one.
 | `g` | Cycle render theme (`orbital` → `neon` → `wild` → `dense` → `classic`) |
 | `v` | Toggle orientation gizmo |
 | `Shift+L` | Toggle atom labels |
+| `Shift+K` | Toggle performance HUD (draw ms / draw FPS) |
 
 ### Diffraction
 | Key | Action |
@@ -77,9 +78,11 @@ Press `Shift+E` to edit the current structure, or `Shift+F` to start a new one.
 | `↑` / `↓` | Previous / next sampled structure |
 | `PageUp` / `PageDown` | Jump 5 samples |
 | `Shift+P` | Cycle ranking mode (`target` / `novelty` / `name`) |
-| `Shift+G` | Toggle 3×3 ensemble grid view (up to 9 samples/page) |
+| `Shift+G` | Toggle adaptive ensemble grid view (up to 9 samples/page) |
+| `f` | Toggle fullscreen on the currently focused structure |
 
 In ensemble mode, camera/display controls apply only to the focused sample.
+Opening a CIF with `Shift+O` always asks whether to add it to the ensemble or open it alone. Adding in regular mode creates an ensemble containing the current structure and the new CIF. Use `Shift+T` to choose or replace the target CIF.
 
 ### Editor
 | Key | Action |

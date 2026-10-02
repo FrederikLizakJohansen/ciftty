@@ -1,5 +1,5 @@
 use std::cmp::Ordering;
-use std::collections::{BTreeMap, HashSet};
+use std::collections::{BTreeMap, HashMap, HashSet};
 use std::env;
 use std::fs;
 use std::io::Stdout;
@@ -84,6 +84,9 @@ const MIN_SPIN_SPEED: f32 = 0.10;
 const MAX_SPIN_SPEED: f32 = 5.00;
 const SPIN_SPEED_STEP: f32 = 0.10;
 const SPIN_BASE_RATE_RAD_PER_SEC: f32 = 1.2;
+const CONTINUOUS_KEY_BASE_RATE_HZ: f32 = 30.0;
+const INPUT_ACTIVE_GRACE_MS: u64 = 180;
+const CONTINUOUS_KEY_ACTIVITY_MS: u64 = 120;
 const ENSEMBLE_FP_BINS: usize = 720;
 const ENSEMBLE_GRID_CAPACITY: usize = 9;
 const ENSEMBLE_GRID_COLUMNS: usize = 3;
@@ -226,6 +229,53 @@ struct EnsembleViewState {
     render_theme: RenderTheme,
 }
 
+impl EnsembleViewState {
+    fn scene_settings_match(&self, other: &Self) -> bool {
+        self.show_boundary_images == other.show_boundary_images
+            && self.show_bonded_images == other.show_bonded_images
+            && (self.bond_max_distance - other.bond_max_distance).abs() <= f32::EPSILON
+    }
+}
+
+#[derive(Debug, Clone)]
+struct EnsembleSceneCache {
+    scene: SceneGeometry,
+    base_scale: f32,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct PerfStats {
+    draw_ms_ema: f32,
+    draw_fps_ema: f32,
+    draw_count: u64,
+}
+
+impl PerfStats {
+    fn new() -> Self {
+        Self {
+            draw_ms_ema: 0.0,
+            draw_fps_ema: 0.0,
+            draw_count: 0,
+        }
+    }
+
+    fn update(&mut self, draw_ms: f32, draw_fps: Option<f32>) {
+        const EMA_ALPHA: f32 = 0.2;
+        self.draw_count = self.draw_count.saturating_add(1);
+
+        if self.draw_count == 1 {
+            self.draw_ms_ema = draw_ms;
+            self.draw_fps_ema = draw_fps.unwrap_or(0.0);
+            return;
+        }
+
+        self.draw_ms_ema = self.draw_ms_ema + EMA_ALPHA * (draw_ms - self.draw_ms_ema);
+        if let Some(fps) = draw_fps {
+            self.draw_fps_ema = self.draw_fps_ema + EMA_ALPHA * (fps - self.draw_fps_ema);
+        }
+    }
+}
+
 #[derive(Debug, Clone)]
 struct EnsembleEntry {
     path: PathBuf,
@@ -234,6 +284,7 @@ struct EnsembleEntry {
     distance_to_target: Option<f32>,
     novelty: f32,
     view_state: EnsembleViewState,
+    scene_cache: EnsembleSceneCache,
 }
 
 #[derive(Debug, Clone)]
@@ -274,13 +325,16 @@ impl EnsembleState {
                 let distance_to_target = target_fingerprint
                     .as_ref()
                     .map(|target_fp| cosine_distance(&fingerprint, target_fp));
+                let view_state = default_view_state.clone();
+                let scene_cache = build_ensemble_scene_cache(&view_state, &structure);
                 EnsembleEntry {
                     path,
                     structure,
                     fingerprint,
                     distance_to_target,
                     novelty: 0.0,
-                    view_state: default_view_state.clone(),
+                    scene_cache,
+                    view_state,
                 }
             })
             .collect();
@@ -368,8 +422,40 @@ impl EnsembleState {
             return;
         };
         if let Some(entry) = self.entries.get_mut(selected_idx) {
+            if !entry.view_state.scene_settings_match(view_state) {
+                entry.scene_cache = build_ensemble_scene_cache(view_state, &entry.structure);
+            }
             entry.view_state = view_state.clone();
         }
+    }
+
+    fn add_sample(
+        &mut self,
+        path: PathBuf,
+        structure: Structure,
+        view_state: EnsembleViewState,
+    ) -> usize {
+        let (_, wavelength) = WAVELENGTH_PRESETS[0];
+        let pattern = compute_pattern(&structure, wavelength, XRD_TWO_THETA_MAX);
+        let fingerprint = xrd_pattern_fingerprint(&pattern, ENSEMBLE_FP_BINS);
+        let distance_to_target = self
+            .target_fingerprint
+            .as_ref()
+            .map(|target_fp| cosine_distance(&fingerprint, target_fp));
+        let scene_cache = build_ensemble_scene_cache(&view_state, &structure);
+        self.entries.push(EnsembleEntry {
+            path,
+            structure,
+            fingerprint,
+            distance_to_target,
+            novelty: 0.0,
+            view_state,
+            scene_cache,
+        });
+        compute_ensemble_novelty(&mut self.entries);
+        let new_idx = self.entries.len().saturating_sub(1);
+        self.refresh_order(Some(new_idx));
+        new_idx
     }
 }
 
@@ -380,8 +466,15 @@ struct FilePickerEntry {
     is_dir: bool,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FilePickerMode {
+    OpenStructure,
+    OpenTarget,
+}
+
 #[derive(Debug, Clone)]
 struct FilePickerState {
+    mode: FilePickerMode,
     cwd: PathBuf,
     entries: Vec<FilePickerEntry>,
     selected: usize,
@@ -389,8 +482,9 @@ struct FilePickerState {
 }
 
 impl FilePickerState {
-    fn new(cwd: PathBuf) -> Self {
+    fn new(cwd: PathBuf, mode: FilePickerMode) -> Self {
         let mut state = Self {
+            mode,
             cwd,
             entries: Vec::new(),
             selected: 0,
@@ -502,6 +596,38 @@ impl FilePickerState {
         if let Some(parent) = self.cwd.parent() {
             self.cwd = parent.to_path_buf();
             self.refresh();
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum OpenCifChoice {
+    AddToEnsemble,
+    OpenAlone,
+}
+
+impl OpenCifChoice {
+    fn toggle(self) -> Self {
+        match self {
+            Self::AddToEnsemble => Self::OpenAlone,
+            Self::OpenAlone => Self::AddToEnsemble,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+struct OpenCifChoiceState {
+    path: PathBuf,
+    structure: Structure,
+    selection: OpenCifChoice,
+}
+
+impl OpenCifChoiceState {
+    fn new(path: PathBuf, structure: Structure) -> Self {
+        Self {
+            path,
+            structure,
+            selection: OpenCifChoice::AddToEnsemble,
         }
     }
 }
@@ -1028,6 +1154,22 @@ fn is_cif_path(path: &Path) -> bool {
         .unwrap_or(false)
 }
 
+fn is_continuous_control_key(code: KeyCode) -> bool {
+    matches!(
+        code,
+        KeyCode::Char('h')
+            | KeyCode::Char('j')
+            | KeyCode::Char('k')
+            | KeyCode::Char('l')
+            | KeyCode::Char('u')
+            | KeyCode::Char('o')
+            | KeyCode::Char('w')
+            | KeyCode::Char('a')
+            | KeyCode::Char('s')
+            | KeyCode::Char('d')
+    )
+}
+
 fn default_open_dialog_dir() -> PathBuf {
     env::current_dir().unwrap_or_else(|_| PathBuf::from("."))
 }
@@ -1067,6 +1209,7 @@ pub struct App {
     render_theme: RenderTheme,
     selected_atom: usize,
     should_quit: bool,
+    active_continuous_keys: HashMap<KeyCode, std::time::Instant>,
     spin_lock: bool,
     spin_speed: f32,
     spin_velocity: [f32; 3], // [pitch, yaw, roll] direction; normalized when non-zero
@@ -1078,6 +1221,7 @@ pub struct App {
     cached_formula: String,
     open_dialog_dir: PathBuf,
     file_picker: Option<FilePickerState>,
+    open_cif_choice: Option<OpenCifChoiceState>,
     show_xrd: bool,
     xrd_wavelength_idx: usize,
     cached_xrd_pattern: XrdPattern,
@@ -1086,6 +1230,9 @@ pub struct App {
     ensemble: Option<EnsembleState>,
     show_target_overlay: bool,
     show_ensemble_grid: bool,
+    show_viewport_fullscreen: bool,
+    show_perf_overlay: bool,
+    perf_stats: PerfStats,
 }
 
 impl App {
@@ -1139,6 +1286,7 @@ impl App {
             render_theme: RenderTheme::Orbital,
             selected_atom: 0,
             should_quit: false,
+            active_continuous_keys: HashMap::new(),
             spin_lock: false,
             spin_speed: DEFAULT_SPIN_SPEED,
             spin_velocity: [0.0, 0.0, 0.0],
@@ -1147,6 +1295,7 @@ impl App {
             cached_formula,
             open_dialog_dir,
             file_picker: None,
+            open_cif_choice: None,
             show_xrd: false,
             xrd_wavelength_idx,
             cached_xrd_pattern,
@@ -1155,28 +1304,64 @@ impl App {
             ensemble: None,
             show_target_overlay: false,
             show_ensemble_grid: false,
+            show_viewport_fullscreen: false,
+            show_perf_overlay: true,
+            perf_stats: PerfStats::new(),
         }
     }
 
     fn handle_key(&mut self, key: KeyEvent) {
         if self.editor.is_some() {
+            self.active_continuous_keys.clear();
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 self.handle_editor_key(key);
             }
             return;
         }
+        if self.open_cif_choice.is_some() {
+            self.active_continuous_keys.clear();
+            if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
+                self.handle_open_cif_choice_key(key.code);
+            }
+            return;
+        }
         if self.file_picker.is_some() {
+            self.active_continuous_keys.clear();
             if matches!(key.kind, KeyEventKind::Press | KeyEventKind::Repeat) {
                 self.handle_file_picker_key(key.code);
             }
             return;
         }
+        self.update_continuous_hold_state(key);
         match key.kind {
             KeyEventKind::Press => self.handle_key_press(key.code),
             KeyEventKind::Repeat => self.handle_key_repeat(key.code),
-            KeyEventKind::Release => {}
+            KeyEventKind::Release => return,
         }
         self.sync_current_view_into_selected_ensemble();
+    }
+
+    fn update_continuous_hold_state(&mut self, key: KeyEvent) {
+        if !is_continuous_control_key(key.code) {
+            return;
+        }
+        let now = std::time::Instant::now();
+        match key.kind {
+            KeyEventKind::Press => {
+                // A quick tap should remain a single discrete step; continuous
+                // interpolation starts only once the terminal emits repeats.
+                self.active_continuous_keys.remove(&key.code);
+            }
+            KeyEventKind::Repeat => {
+                self.active_continuous_keys.insert(
+                    key.code,
+                    now + Duration::from_millis(CONTINUOUS_KEY_ACTIVITY_MS),
+                );
+            }
+            KeyEventKind::Release => {
+                self.active_continuous_keys.remove(&key.code);
+            }
+        }
     }
 
     /// Actions that fire once per key-down (toggles, discrete steps).
@@ -1187,6 +1372,7 @@ impl App {
         match code {
             KeyCode::Char('q') => self.should_quit = true,
             KeyCode::Char('O') => self.open_file_picker(),
+            KeyCode::Char('T') => self.open_target_picker(),
             KeyCode::Char('R') => self.toggle_spin_lock(),
             KeyCode::Char('<') => self.adjust_spin_speed(-SPIN_SPEED_STEP),
             KeyCode::Char('>') => self.adjust_spin_speed(SPIN_SPEED_STEP),
@@ -1222,11 +1408,13 @@ impl App {
             KeyCode::Char('v') => self.toggle_orientation_gizmo(),
             KeyCode::Char('g') => self.toggle_render_theme(),
             KeyCode::Char('L') => self.show_labels = !self.show_labels,
-            KeyCode::Char('X') => self.show_xrd = !self.show_xrd,
+            KeyCode::Char('X') => self.toggle_xrd(),
             KeyCode::Char('W') => self.cycle_xrd_wavelength(),
             KeyCode::Char('P') => self.cycle_ensemble_sort_mode(),
             KeyCode::Char('Y') => self.toggle_target_overlay(),
             KeyCode::Char('G') => self.toggle_ensemble_grid(),
+            KeyCode::Char('f') => self.toggle_viewport_fullscreen(),
+            KeyCode::Char('K') => self.toggle_perf_overlay(),
             KeyCode::Char('A') => self.snap_view_to_lattice_axis(0),
             KeyCode::Char('B') => self.snap_view_to_lattice_axis(1),
             KeyCode::Char('C') => self.snap_view_to_lattice_axis(2),
@@ -1242,7 +1430,63 @@ impl App {
     }
 
     fn open_file_picker(&mut self) {
-        self.file_picker = Some(FilePickerState::new(self.open_dialog_dir.clone()));
+        self.file_picker = Some(FilePickerState::new(
+            self.open_dialog_dir.clone(),
+            FilePickerMode::OpenStructure,
+        ));
+        self.open_cif_choice = None;
+    }
+
+    fn open_target_picker(&mut self) {
+        self.file_picker = Some(FilePickerState::new(
+            self.open_dialog_dir.clone(),
+            FilePickerMode::OpenTarget,
+        ));
+        self.open_cif_choice = None;
+    }
+
+    fn handle_open_cif_choice_key(&mut self, code: KeyCode) {
+        let mut finalize: Option<OpenCifChoice> = None;
+        let mut cancel = false;
+        if let Some(choice) = self.open_cif_choice.as_mut() {
+            match code {
+                KeyCode::Left
+                | KeyCode::Right
+                | KeyCode::Up
+                | KeyCode::Down
+                | KeyCode::Tab
+                | KeyCode::BackTab => {
+                    choice.selection = choice.selection.toggle();
+                }
+                KeyCode::Char('a') | KeyCode::Char('A') => {
+                    finalize = Some(OpenCifChoice::AddToEnsemble);
+                }
+                KeyCode::Char('o') | KeyCode::Char('O') => {
+                    finalize = Some(OpenCifChoice::OpenAlone);
+                }
+                KeyCode::Enter => finalize = Some(choice.selection),
+                KeyCode::Esc => cancel = true,
+                _ => {}
+            }
+        }
+        if cancel {
+            self.open_cif_choice = None;
+            return;
+        }
+        let Some(action) = finalize else {
+            return;
+        };
+        let Some(choice) = self.open_cif_choice.take() else {
+            return;
+        };
+        match action {
+            OpenCifChoice::AddToEnsemble => {
+                self.add_structure_to_ensemble(choice.path, choice.structure);
+            }
+            OpenCifChoice::OpenAlone => {
+                self.open_structure_alone(choice.path, choice.structure);
+            }
+        }
     }
 
     fn attach_ensemble(&mut self, input: EnsembleInput) {
@@ -1268,16 +1512,15 @@ impl App {
                         entry.path.clone(),
                         entry.structure.clone(),
                         entry.view_state.clone(),
+                        entry.scene_cache.clone(),
                     )
                 })
             })
         } else {
             None
         };
-        if let Some((path, structure, view_state)) = selected_entry {
-            self.current_cif_path = Some(path);
-            self.apply_structure(structure);
-            self.apply_ensemble_view_state(&view_state);
+        if let Some((path, structure, view_state, scene_cache)) = selected_entry {
+            self.apply_ensemble_selection(path, structure, view_state, scene_cache);
         }
     }
 
@@ -1291,15 +1534,14 @@ impl App {
                     entry.path.clone(),
                     entry.structure.clone(),
                     entry.view_state.clone(),
+                    entry.scene_cache.clone(),
                 )
             })
         } else {
             None
         };
-        if let Some((path, structure, view_state)) = selected_entry {
-            self.current_cif_path = Some(path);
-            self.apply_structure(structure);
-            self.apply_ensemble_view_state(&view_state);
+        if let Some((path, structure, view_state, scene_cache)) = selected_entry {
+            self.apply_ensemble_selection(path, structure, view_state, scene_cache);
         }
     }
 
@@ -1314,6 +1556,122 @@ impl App {
     fn toggle_ensemble_grid(&mut self) {
         if self.ensemble.is_some() {
             self.show_ensemble_grid = !self.show_ensemble_grid;
+        }
+    }
+
+    fn toggle_viewport_fullscreen(&mut self) {
+        self.show_viewport_fullscreen = !self.show_viewport_fullscreen;
+    }
+
+    fn toggle_xrd(&mut self) {
+        self.show_xrd = !self.show_xrd;
+        if self.show_xrd {
+            self.refresh_xrd_pattern();
+        }
+    }
+
+    fn toggle_perf_overlay(&mut self) {
+        self.show_perf_overlay = !self.show_perf_overlay;
+    }
+
+    fn prompt_cif_open_choice(&mut self, path: PathBuf, structure: Structure) {
+        if let Some(parent) = path.parent() {
+            self.open_dialog_dir = parent.to_path_buf();
+        }
+        self.file_picker = None;
+        self.active_continuous_keys.clear();
+        self.open_cif_choice = Some(OpenCifChoiceState::new(path, structure));
+    }
+
+    fn open_structure_alone(&mut self, path: PathBuf, structure: Structure) {
+        if let Some(parent) = path.parent() {
+            self.open_dialog_dir = parent.to_path_buf();
+        }
+        self.clear_ensemble_mode();
+        self.open_cif_choice = None;
+        self.current_cif_path = Some(path);
+        self.apply_structure(structure);
+        self.file_picker = None;
+    }
+
+    fn add_structure_to_ensemble(&mut self, path: PathBuf, structure: Structure) {
+        if self.ensemble.is_none() {
+            self.create_ensemble_from_current();
+        }
+        if self.ensemble.is_none() {
+            self.attach_ensemble(EnsembleInput {
+                source_dir: self.open_dialog_dir.clone(),
+                samples: vec![(path, structure)],
+                target: None,
+                skipped_files: 0,
+            });
+            self.open_cif_choice = None;
+            self.file_picker = None;
+            return;
+        }
+        self.show_ensemble_grid = true;
+        let current_view_state = self.current_ensemble_view_state();
+        let selected_entry = if let Some(ensemble) = self.ensemble.as_mut() {
+            ensemble.store_view_state_for_selected(&current_view_state);
+            ensemble.add_sample(path, structure, current_view_state);
+            ensemble.selected_entry().map(|entry| {
+                (
+                    entry.path.clone(),
+                    entry.structure.clone(),
+                    entry.view_state.clone(),
+                    entry.scene_cache.clone(),
+                )
+            })
+        } else {
+            None
+        };
+        if let Some((path, structure, view_state, scene_cache)) = selected_entry {
+            self.apply_ensemble_selection(path, structure, view_state, scene_cache);
+        }
+        self.open_cif_choice = None;
+        self.file_picker = None;
+    }
+
+    fn handle_loaded_cif_from_picker(&mut self, path: PathBuf, structure: Structure) {
+        self.prompt_cif_open_choice(path, structure);
+    }
+
+    fn create_ensemble_from_current(&mut self) {
+        let samples = if self.structure.atoms.is_empty() && self.current_cif_path.is_none() {
+            Vec::new()
+        } else {
+            vec![(self.current_cif_path.clone().unwrap_or_else(|| PathBuf::from("current.cif")), self.structure.clone())]
+        };
+        self.ensemble = EnsembleState::from_input(EnsembleInput {
+            source_dir: self.open_dialog_dir.clone(),
+            samples,
+            target: None,
+            skipped_files: 0,
+        }, self.current_ensemble_view_state());
+    }
+
+    fn handle_loaded_target_from_picker(&mut self, path: PathBuf, structure: Structure) {
+        if self.ensemble.is_none() {
+            self.create_ensemble_from_current();
+        }
+        if let Some(ensemble) = self.ensemble.as_mut() {
+            let selected = ensemble.selected_entry_index();
+            let pattern = compute_pattern(&structure, WAVELENGTH_PRESETS[0].1, XRD_TWO_THETA_MAX);
+            let fingerprint = xrd_pattern_fingerprint(&pattern, ENSEMBLE_FP_BINS);
+            for entry in &mut ensemble.entries {
+                entry.distance_to_target = Some(cosine_distance(&entry.fingerprint, &fingerprint));
+            }
+            ensemble.target_path = Some(path.clone());
+            ensemble.target_pattern = Some(pattern);
+            ensemble.target_fingerprint = Some(fingerprint);
+            ensemble.refresh_order(selected);
+            self.show_target_overlay = true;
+            if let Some(parent) = path.parent() {
+                self.open_dialog_dir = parent.to_path_buf();
+            }
+            self.file_picker = None;
+        } else if let Some(picker) = self.file_picker.as_mut() {
+            picker.error = Some("Open a sample structure before choosing a target".to_string());
         }
     }
 
@@ -1356,7 +1714,21 @@ impl App {
         }
     }
 
-    fn apply_ensemble_view_state(&mut self, view_state: &EnsembleViewState) {
+    fn apply_ensemble_selection(
+        &mut self,
+        path: PathBuf,
+        structure: Structure,
+        view_state: EnsembleViewState,
+        scene_cache: EnsembleSceneCache,
+    ) {
+        self.current_cif_path = Some(path);
+        self.structure = structure;
+        self.selected_atom = 0;
+        self.scene = scene_cache.scene;
+        self.base_scale = scene_cache.base_scale;
+        self.cached_element_counts = element_counts(&self.structure.atoms);
+        self.cached_formula = empirical_formula(&self.cached_element_counts);
+
         self.rot_mat = view_state.rot_mat;
         self.zoom = view_state.zoom;
         self.fov_deg = view_state.fov_deg;
@@ -1372,7 +1744,10 @@ impl App {
         self.show_labels = view_state.show_labels;
         self.show_orientation_gizmo = view_state.show_orientation_gizmo;
         self.render_theme = view_state.render_theme;
-        self.rebuild_scene();
+
+        if self.show_xrd {
+            self.refresh_xrd_pattern();
+        }
     }
 
     fn sync_current_view_into_selected_ensemble(&mut self) {
@@ -1382,14 +1757,21 @@ impl App {
         }
     }
 
+    fn record_draw_metrics(&mut self, draw_ms: f32, draw_fps: Option<f32>) {
+        self.perf_stats.update(draw_ms, draw_fps);
+    }
+
     fn clear_ensemble_mode(&mut self) {
         self.ensemble = None;
         self.show_target_overlay = false;
         self.show_ensemble_grid = false;
+        self.show_viewport_fullscreen = false;
+        self.open_cif_choice = None;
     }
 
     fn handle_file_picker_key(&mut self, code: KeyCode) {
         let mut open_path: Option<PathBuf> = None;
+        let mut open_mode: Option<FilePickerMode> = None;
         let mut close_picker = false;
         if let Some(picker) = self.file_picker.as_mut() {
             match code {
@@ -1400,6 +1782,7 @@ impl App {
                 KeyCode::PageDown => picker.move_selection(10),
                 KeyCode::Backspace | KeyCode::Left => picker.go_parent(),
                 KeyCode::Right | KeyCode::Enter => {
+                    open_mode = Some(picker.mode);
                     open_path = picker.open_selected();
                 }
                 _ => {}
@@ -1413,16 +1796,18 @@ impl App {
         let Some(path) = open_path else {
             return;
         };
+        let mode = open_mode.unwrap_or(FilePickerMode::OpenStructure);
 
         match crate::cif::parse_cif_file(&path) {
             Ok(structure) => {
-                self.clear_ensemble_mode();
-                self.current_cif_path = Some(path.clone());
-                self.apply_structure(structure);
-                if let Some(parent) = path.parent() {
-                    self.open_dialog_dir = parent.to_path_buf();
+                match mode {
+                    FilePickerMode::OpenStructure => {
+                        self.handle_loaded_cif_from_picker(path, structure);
+                    }
+                    FilePickerMode::OpenTarget => {
+                        self.handle_loaded_target_from_picker(path, structure);
+                    }
                 }
-                self.file_picker = None;
             }
             Err(err) => {
                 if let Some(picker) = self.file_picker.as_mut() {
@@ -1446,6 +1831,9 @@ impl App {
                 return;
             }
             _ => {}
+        }
+        if is_continuous_control_key(code) {
+            return;
         }
         self.apply_continuous_key(code);
     }
@@ -1526,6 +1914,7 @@ impl App {
 
     fn toggle_spin_lock(&mut self) {
         self.spin_lock = !self.spin_lock;
+        self.active_continuous_keys.clear();
         if !self.spin_lock {
             self.spin_velocity = [0.0, 0.0, 0.0];
         }
@@ -1567,24 +1956,97 @@ impl App {
         ];
     }
 
-    fn update_spin_motion(&mut self, delta_seconds: f32) {
+    fn update_manual_hold_motion(&mut self, delta_seconds: f32) -> bool {
+        if self.spin_lock {
+            return false;
+        }
+        let now = std::time::Instant::now();
+        self.active_continuous_keys.retain(|_, active_until| *active_until > now);
+        if self.active_continuous_keys.is_empty() {
+            return false;
+        }
+        let frame_scale = CONTINUOUS_KEY_BASE_RATE_HZ * delta_seconds.max(0.0);
+        if frame_scale <= 0.0 {
+            return false;
+        }
+
+        let is_active = |code: KeyCode| -> bool {
+            self.active_continuous_keys
+                .get(&code)
+                .is_some_and(|active_until| *active_until > now)
+        };
+        let axis = |neg: KeyCode, pos: KeyCode| -> f32 {
+            (i32::from(is_active(pos)) - i32::from(is_active(neg))) as f32
+        };
+        let pitch = axis(KeyCode::Char('k'), KeyCode::Char('j'));
+        let yaw = axis(KeyCode::Char('h'), KeyCode::Char('l'));
+        let roll = axis(KeyCode::Char('u'), KeyCode::Char('o'));
+        let pan_x = axis(KeyCode::Char('a'), KeyCode::Char('d'));
+        let pan_y = axis(KeyCode::Char('s'), KeyCode::Char('w'));
+
+        let mut changed = false;
+        if pitch.abs() > f32::EPSILON {
+            self.rot_mat = mat_mul_3x3(mat_rot_x(pitch * ROTATION_STEP * frame_scale), self.rot_mat);
+            changed = true;
+        }
+        if yaw.abs() > f32::EPSILON {
+            self.rot_mat = mat_mul_3x3(mat_rot_y(yaw * ROTATION_STEP * frame_scale), self.rot_mat);
+            changed = true;
+        }
+        if roll.abs() > f32::EPSILON {
+            self.rot_mat = mat_mul_3x3(mat_rot_z(roll * ROLL_STEP * frame_scale), self.rot_mat);
+            changed = true;
+        }
+        if pan_x.abs() > f32::EPSILON {
+            self.pan[0] += pan_x * PAN_STEP * frame_scale;
+            changed = true;
+        }
+        if pan_y.abs() > f32::EPSILON {
+            self.pan[1] += pan_y * PAN_STEP * frame_scale;
+            changed = true;
+        }
+
+        if changed {
+            self.sync_current_view_into_selected_ensemble();
+        }
+        changed
+    }
+
+    fn update_spin_motion(&mut self, delta_seconds: f32) -> bool {
         if !self.spin_lock {
-            return;
+            return false;
         }
         let vx = self.spin_velocity[0];
         let vy = self.spin_velocity[1];
         let vz = self.spin_velocity[2];
         if vx.abs() <= f32::EPSILON && vy.abs() <= f32::EPSILON && vz.abs() <= f32::EPSILON {
-            return;
+            return false;
         }
         let step = SPIN_BASE_RATE_RAD_PER_SEC * self.spin_speed * delta_seconds.max(0.0);
         if step <= 0.0 {
-            return;
+            return false;
         }
         self.rot_mat = mat_mul_3x3(mat_rot_x(vx * step), self.rot_mat);
         self.rot_mat = mat_mul_3x3(mat_rot_y(vy * step), self.rot_mat);
         self.rot_mat = mat_mul_3x3(mat_rot_z(vz * step), self.rot_mat);
         self.sync_current_view_into_selected_ensemble();
+        true
+    }
+
+    fn is_manual_hold_animating(&self) -> bool {
+        let now = std::time::Instant::now();
+        !self.spin_lock
+            && self
+                .active_continuous_keys
+                .values()
+                .any(|active_until| *active_until > now)
+    }
+
+    fn is_spin_animating(&self) -> bool {
+        self.spin_lock
+            && (self.spin_velocity[0].abs() > f32::EPSILON
+                || self.spin_velocity[1].abs() > f32::EPSILON
+                || self.spin_velocity[2].abs() > f32::EPSILON)
     }
 
     fn adjust_bond_max_distance(&mut self, delta: f32) {
@@ -1783,6 +2245,12 @@ impl App {
         self.rebuild_scene();
         self.cached_element_counts = element_counts(&self.structure.atoms);
         self.cached_formula = empirical_formula(&self.cached_element_counts);
+        if self.show_xrd {
+            self.refresh_xrd_pattern();
+        }
+    }
+
+    fn refresh_xrd_pattern(&mut self) {
         self.cached_xrd_pattern = compute_pattern(
             &self.structure,
             WAVELENGTH_PRESETS[self.xrd_wavelength_idx].1,
@@ -1792,11 +2260,9 @@ impl App {
 
     fn cycle_xrd_wavelength(&mut self) {
         self.xrd_wavelength_idx = (self.xrd_wavelength_idx + 1) % WAVELENGTH_PRESETS.len();
-        self.cached_xrd_pattern = compute_pattern(
-            &self.structure,
-            WAVELENGTH_PRESETS[self.xrd_wavelength_idx].1,
-            XRD_TWO_THETA_MAX,
-        );
+        if self.show_xrd {
+            self.refresh_xrd_pattern();
+        }
     }
 
     fn open_editor_for_current(&mut self) {
@@ -2062,23 +2528,51 @@ pub fn run(
     if let Some(ensemble_input) = ensemble {
         app.attach_ensemble(ensemble_input);
     }
-    let tick_rate = Duration::from_millis(16);
+    let active_tick_rate = Duration::from_millis(16);
+    let idle_tick_rate = Duration::from_millis(250);
+    let input_active_grace = Duration::from_millis(INPUT_ACTIVE_GRACE_MS);
+    let mut input_active_until = std::time::Instant::now();
     let mut previous_frame_time = std::time::Instant::now();
+    let mut previous_draw_start: Option<std::time::Instant> = None;
+    let mut needs_redraw = true;
 
     while !app.should_quit {
-        // Wait up to one tick for the first event, then drain any further
-        // events that arrived during the same tick window without blocking.
+        let input_recently_active = std::time::Instant::now() < input_active_until;
+        let tick_rate = if app.is_spin_animating()
+            || app.is_manual_hold_animating()
+            || input_recently_active
+        {
+            active_tick_rate
+        } else {
+            idle_tick_rate
+        };
+        // Wait up to one tick for the first event, then drain any queued
+        // follow-up events without blocking.
         let deadline = std::time::Instant::now() + tick_rate;
+        let mut saw_event = false;
         loop {
-            let remaining = deadline.saturating_duration_since(std::time::Instant::now());
-            if !event::poll(remaining)? {
+            let timeout = if saw_event {
+                Duration::ZERO
+            } else {
+                deadline.saturating_duration_since(std::time::Instant::now())
+            };
+            if !event::poll(timeout)? {
                 break; // tick elapsed with no more events
             }
             match event::read()? {
-                Event::Key(key) => app.handle_key(key),
-                Event::Mouse(mouse) => app.handle_mouse(mouse),
+                Event::Key(key) => {
+                    app.handle_key(key);
+                    needs_redraw = true;
+                    input_active_until = std::time::Instant::now() + input_active_grace;
+                }
+                Event::Mouse(mouse) => {
+                    app.handle_mouse(mouse);
+                    needs_redraw = true;
+                    input_active_until = std::time::Instant::now() + input_active_grace;
+                }
                 _ => {}
             }
+            saw_event = true;
             if deadline <= std::time::Instant::now() {
                 break; // don't overrun into the next frame
             }
@@ -2090,11 +2584,31 @@ pub fn run(
             .as_secs_f32()
             .clamp(0.0, 0.1);
         previous_frame_time = now;
-        app.update_spin_motion(delta_seconds);
+        if app.update_manual_hold_motion(delta_seconds) {
+            needs_redraw = true;
+        }
+        if app.update_spin_motion(delta_seconds) {
+            needs_redraw = true;
+        }
 
-        terminal.draw(|frame| {
-            draw(frame, &app);
-        })?;
+        if needs_redraw {
+            let draw_start = std::time::Instant::now();
+            let draw_fps = previous_draw_start.and_then(|prev| {
+                let dt = draw_start.saturating_duration_since(prev).as_secs_f32();
+                if dt > f32::EPSILON {
+                    Some(1.0 / dt)
+                } else {
+                    None
+                }
+            });
+            terminal.draw(|frame| {
+                draw(frame, &app);
+            })?;
+            let draw_ms = draw_start.elapsed().as_secs_f32() * 1_000.0;
+            app.record_draw_metrics(draw_ms, draw_fps);
+            previous_draw_start = Some(draw_start);
+            needs_redraw = false;
+        }
     }
 
     Ok(())
@@ -2102,6 +2616,33 @@ pub fn run(
 
 fn draw(frame: &mut ratatui::Frame, app: &App) {
     let area = frame.area();
+
+    if app.show_viewport_fullscreen {
+        let viewport_block = Block::default()
+            .borders(Borders::ALL)
+            .padding(Padding::new(1, 1, 0, 0))
+            .title(viewport_title(app));
+        let viewport_inner = viewport_block.inner(area);
+        let viewport = render_viewport_text(
+            app,
+            viewport_inner.width as usize,
+            viewport_inner.height as usize,
+        );
+        let viewport_paragraph = Paragraph::new(viewport).block(viewport_block);
+        frame.render_widget(viewport_paragraph, area);
+
+        if let Some(file_picker) = &app.file_picker {
+            draw_file_picker(frame, file_picker);
+        }
+
+        if let Some(editor) = &app.editor {
+            draw_editor(frame, editor, area);
+        }
+        if let Some(choice) = &app.open_cif_choice {
+            draw_open_cif_choice(frame, choice);
+        }
+        return;
+    }
 
     // Optionally carve a horizontal XRD strip from the bottom.
     let (top_area, xrd_area) = if app.show_xrd {
@@ -2169,6 +2710,10 @@ fn draw(frame: &mut ratatui::Frame, app: &App) {
 
     if let Some(editor) = &app.editor {
         draw_editor(frame, editor, root[0]);
+    }
+
+    if let Some(choice) = &app.open_cif_choice {
+        draw_open_cif_choice(frame, choice);
     }
 }
 
@@ -2490,6 +3035,65 @@ fn draw_xrd_panel(frame: &mut ratatui::Frame, app: &App, area: Rect) {
     frame.render_widget(Paragraph::new(lines), inner);
 }
 
+fn draw_open_cif_choice(frame: &mut ratatui::Frame, choice: &OpenCifChoiceState) {
+    let popup = centered_rect_sized(70, 10, frame.area());
+    frame.render_widget(Clear, popup);
+    let block = Block::default()
+        .borders(Borders::ALL)
+        .border_type(BorderType::Rounded)
+        .padding(Padding::new(1, 1, 0, 0))
+        .title(" Open CIF ");
+    let inner = block.inner(popup);
+    frame.render_widget(block, popup);
+
+    let name = choice
+        .path
+        .file_name()
+        .and_then(|s| s.to_str())
+        .unwrap_or("unknown.cif");
+    let max_inner_width = inner.width.saturating_sub(2) as usize;
+    let file_text = elide_right(&format!("file {}", name), max_inner_width);
+
+    let option_style = |selected: bool| {
+        if selected {
+            Style::default()
+                .fg(Color::Black)
+                .bg(Color::LightYellow)
+                .add_modifier(Modifier::BOLD)
+        } else {
+            Style::default().fg(Color::Gray)
+        }
+    };
+
+    let add_selected = choice.selection == OpenCifChoice::AddToEnsemble;
+    let alone_selected = choice.selection == OpenCifChoice::OpenAlone;
+
+    let lines = vec![
+        Line::from(Span::styled(
+            "How should this CIF be opened?",
+            Style::default()
+                .fg(Color::White)
+                .add_modifier(Modifier::BOLD),
+        )),
+        Line::from(Span::styled(file_text, Style::default().fg(Color::LightCyan))),
+        Line::default(),
+        Line::from(vec![
+            Span::styled("[A] ", Style::default().fg(Color::LightYellow)),
+            Span::styled("Add to ensemble", option_style(add_selected)),
+        ]),
+        Line::from(vec![
+            Span::styled("[O] ", Style::default().fg(Color::LightYellow)),
+            Span::styled("Open alone", option_style(alone_selected)),
+        ]),
+        Line::default(),
+        Line::from(Span::styled(
+            "Enter confirm  Tab toggle  Esc cancel",
+            Style::default().fg(Color::DarkGray),
+        )),
+    ];
+    frame.render_widget(Paragraph::new(lines).wrap(Wrap { trim: false }), inner);
+}
+
 fn draw_file_picker(frame: &mut ratatui::Frame, picker: &FilePickerState) {
     let popup = centered_rect_sized(68, 22, frame.area());
     frame.render_widget(Clear, popup);
@@ -2497,7 +3101,10 @@ fn draw_file_picker(frame: &mut ratatui::Frame, picker: &FilePickerState) {
         .borders(Borders::ALL)
         .border_type(BorderType::Rounded)
         .padding(Padding::new(1, 1, 0, 0))
-        .title(" CIF Browser ");
+        .title(match picker.mode {
+            FilePickerMode::OpenStructure => " CIF Browser ",
+            FilePickerMode::OpenTarget => " Choose Target CIF ",
+        });
     let inner = block.inner(popup);
     frame.render_widget(block, popup);
 
@@ -3334,12 +3941,14 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
     vec![
         section_header("VIEW"),
         control_short_value_line("Shift+O", "Open", "CIF dialog".to_string(), Color::Gray),
+        control_short_value_line("Shift+T", "Target", "Open/change CIF".to_string(), Color::Gray),
         control_short_value_line(
             "g",
             "Theme",
             app.render_theme.label().to_string(),
             theme_color(app.render_theme),
         ),
+        control_short_bool_line("K", "Perf HUD", app.show_perf_overlay),
         control_short_bool_line("R", "Spin lock", app.spin_lock),
         control_short_value_line(
             "<>",
@@ -3352,6 +3961,7 @@ fn controls_keys_panel_lines(app: &App) -> Vec<Line<'static>> {
         control_short_bool_line("x", "Cell overlay", app.cell_on_top),
         control_short_bool_line("v", "Gizmo", app.show_orientation_gizmo),
         control_short_bool_line("L", "Labels", app.show_labels),
+        control_short_bool_line("f", "Fullscreen", app.show_viewport_fullscreen),
         section_header("IMAGES"),
         control_short_value_line(
             "r",
@@ -3618,17 +4228,44 @@ fn cell_volume(cell: Cell) -> f32 {
 }
 
 fn viewport_title(app: &App) -> String {
-    if let Some((start, end)) = app.ensemble_grid_page_bounds() {
+    let base_title = if app.show_viewport_fullscreen {
         if let Some(ensemble) = &app.ensemble {
-            return format!(
+            format!(
+                "3D View · Fullscreen · Sample {}/{}",
+                ensemble.selected_rank.saturating_add(1),
+                ensemble.order.len()
+            )
+        } else {
+            "3D View · Fullscreen".to_string()
+        }
+    } else if let Some((start, end)) = app.ensemble_grid_page_bounds() {
+        if let Some(ensemble) = &app.ensemble {
+            format!(
                 "3D View · Ensemble Grid {}-{} / {}",
                 start + 1,
                 end,
                 ensemble.order.len()
-            );
+            )
+        } else {
+            "3D View".to_string()
         }
+    } else {
+        "3D View".to_string()
+    };
+
+    if !app.show_perf_overlay {
+        return base_title;
     }
-    "3D View".to_string()
+
+    let metrics = if app.perf_stats.draw_count == 0 {
+        "HUD warming up".to_string()
+    } else {
+        format!(
+            "{:.2} ms · {:.1} FPS(draw)",
+            app.perf_stats.draw_ms_ema, app.perf_stats.draw_fps_ema
+        )
+    };
+    format!("{base_title} · {metrics}")
 }
 
 fn render_primary_viewport_text(app: &App, width: usize, height: usize) -> Text<'static> {
@@ -3636,6 +4273,16 @@ fn render_primary_viewport_text(app: &App, width: usize, height: usize) -> Text<
         return grid_text;
     }
     render_viewport_text(app, width, height)
+}
+
+fn ensemble_grid_dimensions(count: usize) -> (usize, usize) {
+    if count == 0 {
+        return (0, 0);
+    }
+    let max_columns = ENSEMBLE_GRID_COLUMNS.max(1);
+    let columns = ((count as f32).sqrt().ceil() as usize).clamp(1, max_columns);
+    let rows = count.div_ceil(columns).max(1);
+    (columns, rows)
 }
 
 fn render_ensemble_grid_text(app: &App, width: usize, height: usize) -> Option<Text<'static>> {
@@ -3650,8 +4297,7 @@ fn render_ensemble_grid_text(app: &App, width: usize, height: usize) -> Option<T
         return None;
     }
 
-    let columns = ENSEMBLE_GRID_COLUMNS.min(count.max(1));
-    let rows = (count + columns - 1) / columns;
+    let (columns, rows) = ensemble_grid_dimensions(count);
     let separator_cols = columns.saturating_sub(1);
     let separator_rows = rows.saturating_sub(1);
     if width <= separator_cols || height <= separator_rows {
@@ -3701,18 +4347,11 @@ fn render_ensemble_grid_text(app: &App, width: usize, height: usize) -> Option<T
 
         let entry = &ensemble.entries[entry_idx];
         let view = &entry.view_state;
-        let scene = build_scene(
-            &entry.structure,
-            view.show_boundary_images,
-            view.show_bonded_images,
-            view.bond_max_distance,
-        );
-        let base_scale = bounding_sphere_scale(&scene);
         let tile_buffer = render_viewport_buffer_with_config(
             &ViewportRenderConfig {
                 structure: &entry.structure,
-                scene: &scene,
-                base_scale,
+                scene: &entry.scene_cache.scene,
+                base_scale: entry.scene_cache.base_scale,
                 rot_mat: view.rot_mat,
                 zoom: view.zoom,
                 fov_deg: view.fov_deg,
@@ -4654,6 +5293,20 @@ struct SceneGeometry {
     bonded_image_count: usize,
 }
 
+fn build_ensemble_scene_cache(
+    view_state: &EnsembleViewState,
+    structure: &Structure,
+) -> EnsembleSceneCache {
+    let scene = build_scene(
+        structure,
+        view_state.show_boundary_images,
+        view_state.show_bonded_images,
+        view_state.bond_max_distance,
+    );
+    let base_scale = bounding_sphere_scale(&scene);
+    EnsembleSceneCache { scene, base_scale }
+}
+
 fn build_scene(
     structure: &Structure,
     include_boundary_images: bool,
@@ -4944,14 +5597,15 @@ fn mat_from_euler(pitch: f32, yaw: f32, roll: f32) -> [[f32; 3]; 3] {
 #[cfg(test)]
 mod tests {
     use super::{
-        best_image_shift_and_distance, boundary_axis_shifts, build_scene, mat_from_euler,
-        project_world, render_viewport, App, RenderTheme, ViewportTransform, CHAR_ASPECT,
-        DEFAULT_BOND_MAX_DISTANCE, ISO_PITCH, ISO_YAW, MAX_SPIN_SPEED, MIN_FOV_DEG, MIN_SPIN_SPEED,
-        MOUSE_SENSITIVITY,
+        best_image_shift_and_distance, boundary_axis_shifts, build_scene,
+        ensemble_grid_dimensions, mat_from_euler, project_world, render_viewport, App,
+        EnsembleInput, RenderTheme, ViewportTransform, CHAR_ASPECT, DEFAULT_BOND_MAX_DISTANCE,
+        ISO_PITCH, ISO_YAW, MAX_SPIN_SPEED, MIN_FOV_DEG, MIN_SPIN_SPEED, MOUSE_SENSITIVITY,
     };
     use crate::cif::parse_cif_str;
     use crate::model::{Atom, Cell, Structure};
     use crossterm::event::{KeyCode, KeyModifiers, MouseButton, MouseEvent, MouseEventKind};
+    use std::path::PathBuf;
 
     #[test]
     fn detects_boundary_repeat_shifts() {
@@ -4959,6 +5613,20 @@ mod tests {
         assert!(shifts[0].contains(&1));
         assert!(shifts[1].contains(&0));
         assert!(shifts[2].contains(&-1));
+    }
+
+    #[test]
+    fn ensemble_grid_dimensions_scale_with_count() {
+        assert_eq!(ensemble_grid_dimensions(0), (0, 0));
+        assert_eq!(ensemble_grid_dimensions(1), (1, 1));
+        assert_eq!(ensemble_grid_dimensions(2), (2, 1));
+        assert_eq!(ensemble_grid_dimensions(3), (2, 2));
+        assert_eq!(ensemble_grid_dimensions(4), (2, 2));
+        assert_eq!(ensemble_grid_dimensions(5), (3, 2));
+        assert_eq!(ensemble_grid_dimensions(6), (3, 2));
+        assert_eq!(ensemble_grid_dimensions(7), (3, 3));
+        assert_eq!(ensemble_grid_dimensions(8), (3, 3));
+        assert_eq!(ensemble_grid_dimensions(9), (3, 3));
     }
 
     #[test]
@@ -5422,6 +6090,85 @@ mod tests {
     }
 
     #[test]
+    fn held_manual_key_animates_between_key_events() {
+        let structure = Structure {
+            title: "manual hold test".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(structure);
+        let initial = app.rot_mat;
+        app.active_continuous_keys.insert(
+            KeyCode::Char('l'),
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        );
+
+        assert!(app.is_manual_hold_animating());
+        assert!(app.update_manual_hold_motion(0.05));
+
+        let mut changed = false;
+        for i in 0..3 {
+            for j in 0..3 {
+                if (app.rot_mat[i][j] - initial[i][j]).abs() > 1e-6 {
+                    changed = true;
+                }
+            }
+        }
+        assert!(changed, "held key should rotate even without repeat events");
+    }
+
+    #[test]
+    fn spin_lock_suppresses_manual_hold_motion() {
+        let structure = Structure {
+            title: "spin suppress manual hold test".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(structure);
+        app.active_continuous_keys.insert(
+            KeyCode::Char('l'),
+            std::time::Instant::now() + std::time::Duration::from_millis(50),
+        );
+        let initial = app.rot_mat;
+
+        app.handle_key_press(KeyCode::Char('R'));
+        assert!(app.spin_lock);
+        assert!(!app.update_manual_hold_motion(0.05));
+        for i in 0..3 {
+            for j in 0..3 {
+                assert!((app.rot_mat[i][j] - initial[i][j]).abs() < 1e-9);
+            }
+        }
+    }
+
+    #[test]
+    fn manual_hold_key_activity_expires_without_repeat_events() {
+        let structure = Structure {
+            title: "manual hold expiry test".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(structure);
+        app.active_continuous_keys.insert(
+            KeyCode::Char('l'),
+            std::time::Instant::now() - std::time::Duration::from_millis(1),
+        );
+        assert!(!app.is_manual_hold_animating());
+        assert!(!app.update_manual_hold_motion(0.05));
+    }
+
+    #[test]
     fn spin_speed_keys_adjust_and_clamp() {
         let structure = Structure {
             title: "spin speed test".to_string(),
@@ -5483,6 +6230,151 @@ mod tests {
 
         app.handle_key_press(KeyCode::Char('L'));
         assert!(app.show_labels);
+    }
+
+    #[test]
+    fn fullscreen_viewport_toggles_with_f_key() {
+        let structure = Structure {
+            title: "fullscreen toggle test".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(structure);
+        assert!(!app.show_viewport_fullscreen);
+
+        app.handle_key_press(KeyCode::Char('f'));
+        assert!(app.show_viewport_fullscreen);
+
+        app.handle_key_press(KeyCode::Char('f'));
+        assert!(!app.show_viewport_fullscreen);
+    }
+
+    #[test]
+    fn regular_mode_add_preserves_current_sample_and_target_can_change() {
+        let sample = parse_cif_str(include_str!("../data/Fe.cif"), "sample").unwrap();
+        let mut app = App::new(sample.clone());
+        app.handle_loaded_cif_from_picker(PathBuf::from("added.cif"), sample.clone());
+        assert!(app.open_cif_choice.is_some());
+        app.handle_open_cif_choice_key(KeyCode::Char('a'));
+        assert_eq!(app.ensemble.as_ref().unwrap().entries.len(), 2);
+        let selected = app.ensemble.as_ref().unwrap().selected_entry_index();
+        app.handle_loaded_target_from_picker(PathBuf::from("target.cif"), sample.clone());
+        app.handle_loaded_target_from_picker(PathBuf::from("replacement.cif"), sample);
+        let ensemble = app.ensemble.as_ref().unwrap();
+        assert_eq!(ensemble.target_path, Some(PathBuf::from("replacement.cif")));
+        assert_eq!(ensemble.selected_entry_index(), selected);
+        assert!(ensemble.entries.iter().all(|entry| entry.distance_to_target == Some(0.0)));
+    }
+
+    #[test]
+    fn opening_cif_in_ensemble_prompts_for_add_or_open_alone() {
+        let sample_structure = Structure {
+            title: "sample".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(sample_structure.clone());
+        app.attach_ensemble(EnsembleInput {
+            source_dir: PathBuf::from("ensemble"),
+            samples: vec![(PathBuf::from("sample_0.cif"), sample_structure)],
+            target: None,
+            skipped_files: 0,
+        });
+
+        let opened_structure = Structure {
+            title: "opened".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        app.handle_loaded_cif_from_picker(PathBuf::from("opened.cif"), opened_structure);
+
+        assert!(app.open_cif_choice.is_some());
+        assert!(app.ensemble.is_some());
+    }
+
+    #[test]
+    fn open_choice_add_appends_to_ensemble() {
+        let sample_structure = Structure {
+            title: "sample".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(sample_structure.clone());
+        app.attach_ensemble(EnsembleInput {
+            source_dir: PathBuf::from("ensemble"),
+            samples: vec![(PathBuf::from("sample_0.cif"), sample_structure)],
+            target: None,
+            skipped_files: 0,
+        });
+        let before = app.ensemble.as_ref().map(|ens| ens.entries.len()).unwrap_or(0);
+
+        let opened_structure = Structure {
+            title: "opened".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        app.handle_loaded_cif_from_picker(PathBuf::from("opened.cif"), opened_structure);
+        app.handle_open_cif_choice_key(KeyCode::Char('a'));
+
+        let after = app.ensemble.as_ref().map(|ens| ens.entries.len()).unwrap_or(0);
+        assert_eq!(after, before + 1);
+        assert!(app.open_cif_choice.is_none());
+    }
+
+    #[test]
+    fn open_choice_open_alone_exits_ensemble_mode() {
+        let sample_structure = Structure {
+            title: "sample".to_string(),
+            atoms: vec![Atom {
+                label: "A".to_string(),
+                element: "C".to_string(),
+                position: [0.0, 0.0, 0.0],
+                fractional: None,
+            }],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        let mut app = App::new(sample_structure.clone());
+        app.attach_ensemble(EnsembleInput {
+            source_dir: PathBuf::from("ensemble"),
+            samples: vec![(PathBuf::from("sample_0.cif"), sample_structure)],
+            target: None,
+            skipped_files: 0,
+        });
+
+        let opened_structure = Structure {
+            title: "opened".to_string(),
+            atoms: vec![],
+            cell: None,
+            space_group: None,
+            ..Default::default()
+        };
+        app.handle_loaded_cif_from_picker(PathBuf::from("opened.cif"), opened_structure);
+        app.handle_open_cif_choice_key(KeyCode::Char('o'));
+
+        assert!(app.ensemble.is_none());
+        assert!(app.open_cif_choice.is_none());
     }
 
     #[test]
